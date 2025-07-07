@@ -71,6 +71,7 @@ class Program
         services.AddScoped<IPromptFileService, PromptFileService>();
         services.AddScoped<ISystemPromptService, SystemPromptService>();
         services.AddScoped<IEnvironmentVariableService, EnvironmentVariableService>();
+        services.AddScoped<IAiPlanningService, AiPlanningService>();
 
         // Commands
         services.AddScoped<ConnectCommand>();

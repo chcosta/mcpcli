@@ -15,6 +15,7 @@ public class RunCommand
     private readonly IAzureAiService _azureAiService;
     private readonly IPromptFileService _promptFileService;
     private readonly ISystemPromptService _systemPromptService;
+    private readonly IAiPlanningService? _aiPlanningService;
 
     public RunCommand(
         ILogger<RunCommand> logger,
@@ -24,7 +25,8 @@ public class RunCommand
         IMcpServerService mcpServerService,
         IAzureAiService azureAiService,
         IPromptFileService promptFileService,
-        ISystemPromptService systemPromptService)
+        ISystemPromptService systemPromptService,
+        IAiPlanningService? aiPlanningService = null)
     {
         _logger = logger;
         _markdownConfigService = markdownConfigService;
@@ -34,6 +36,7 @@ public class RunCommand
         _azureAiService = azureAiService;
         _promptFileService = promptFileService;
         _systemPromptService = systemPromptService;
+        _aiPlanningService = aiPlanningService;
     }
 
     public Command CreateCommand()
@@ -71,6 +74,11 @@ public class RunCommand
             description: "Working directory for cloned repositories (default: ./mcp-servers)",
             getDefaultValue: () => "./mcp-servers");
 
+        var previewFeaturesOption = new Option<bool>(
+            name: "--preview-features",
+            description: "Enable preview features like AI planning (overrides config setting)",
+            getDefaultValue: () => false);
+
         var command = new Command("run", "Run MCP CLI using a Markdown configuration file")
         {
             configFileOption,
@@ -78,18 +86,19 @@ public class RunCommand
             promptFileOption,
             listPromptsOption,
             promptIndexOption,
-            workingDirOption
+            workingDirOption,
+            previewFeaturesOption
         };
 
-        command.SetHandler(async (configFile, prompt, promptFile, listPrompts, promptIndex, workingDir) =>
+        command.SetHandler(async (configFile, prompt, promptFile, listPrompts, promptIndex, workingDir, previewFeatures) =>
         {
-            await ExecuteAsync(configFile, prompt, promptFile, listPrompts, promptIndex, workingDir);
-        }, configFileOption, promptOption, promptFileOption, listPromptsOption, promptIndexOption, workingDirOption);
+            await ExecuteAsync(configFile, prompt, promptFile, listPrompts, promptIndex, workingDir, previewFeatures);
+        }, configFileOption, promptOption, promptFileOption, listPromptsOption, promptIndexOption, workingDirOption, previewFeaturesOption);
 
         return command;
     }
 
-    private async Task ExecuteAsync(string configFile, string? prompt, string? promptFile, bool listPrompts, int promptIndex, string workingDir)
+    private async Task ExecuteAsync(string configFile, string? prompt, string? promptFile, bool listPrompts, int promptIndex, string workingDir, bool previewFeatures)
     {
         try
         {
@@ -165,7 +174,7 @@ public class RunCommand
             await ApplyConfigurationAsync(markdownConfig);
 
             // Execute the main workflow
-            await ExecuteWorkflowAsync(markdownConfig, selectedPrompt, workingDir);
+            await ExecuteWorkflowAsync(markdownConfig, selectedPrompt, workingDir, previewFeatures, configFile, promptFile);
         }
         catch (Exception ex)
         {
@@ -209,13 +218,37 @@ public class RunCommand
         }
     }
 
-    private async Task ExecuteWorkflowAsync(Models.MarkdownConfig markdownConfig, string prompt, string workingDir)
+    private async Task ExecuteWorkflowAsync(Models.MarkdownConfig markdownConfig, string prompt, string workingDir, bool previewFeaturesFlag, string configFile, string? promptFile)
     {
+        var executionSummary = new Models.ExecutionSummary
+        {
+            AzureAiEndpoint = markdownConfig.AzureAi.Endpoint,
+            AzureAiModel = markdownConfig.AzureAi.ModelName,
+            PreviewFeaturesEnabled = previewFeaturesFlag || markdownConfig.PreviewFeatures
+        };
+
+        // Track files read during execution
+        executionSummary.AddConfigurationFileRead(configFile);
+        if (!string.IsNullOrEmpty(promptFile))
+        {
+            executionSummary.AddPromptFileRead(promptFile);
+        }
+        
+        // Track AI planning prompt file if it exists
+        if (!string.IsNullOrEmpty(markdownConfig.AiPlanningPromptFile))
+        {
+            executionSummary.AddOtherMarkdownFileRead(markdownConfig.AiPlanningPromptFile);
+        }
+
         try
         {
             // Get repository name and local path
             var repoName = _gitService.GetRepositoryNameFromUrl(markdownConfig.RepositoryUrl);
             var localPath = Path.Combine(workingDir, repoName);
+
+            // Track repository and MCP server usage
+            executionSummary.AddRepositoryCloned(markdownConfig.RepositoryUrl);
+            executionSummary.AddMcpServerUsed(markdownConfig.Name);
 
             // Clone or update repository
             if (!await _gitService.IsRepositoryClonedAsync(localPath))
@@ -262,13 +295,36 @@ public class RunCommand
 
                 try
                 {
-                    // Use AI to intelligently interact with MCP server
-                    Console.WriteLine($"Sending prompt: {prompt}");
-                    var finalResponse = await ProcessPromptWithAIAsync(runningServer, prompt, markdownConfig);
+                    // Determine if preview features should be used
+                    bool usePreviewFeatures = previewFeaturesFlag || markdownConfig.PreviewFeatures;
                     
-                    Console.WriteLine("\n--- Final Response ---");
-                    Console.WriteLine(finalResponse);
-                    Console.WriteLine("--- End Response ---");
+                    Console.WriteLine($"Sending prompt: {prompt}");
+                    
+                    string finalResponse;
+                    if (usePreviewFeatures)
+                    {
+                        Console.WriteLine("Using preview features (AI planning mode)");
+                        executionSummary.ExecutionMode = "AI Planning Mode";
+                        
+                        if (_aiPlanningService != null)
+                        {
+                            Console.WriteLine("Using AI Planning Service");
+                            finalResponse = await _aiPlanningService.ProcessPromptWithAIAsync(runningServer, prompt, markdownConfig, executionSummary);
+                        }
+                        else
+                        {
+                            Console.WriteLine("AI Planning Service not available, falling back to built-in AI planning");
+                            finalResponse = await ProcessPromptWithAIAsync(runningServer, prompt, markdownConfig, executionSummary);
+                        }
+                    }
+                    else
+                    {
+                        Console.WriteLine("Using simple mode (direct tool execution)");
+                        executionSummary.ExecutionMode = "Simple Mode (Direct Tool Execution)";
+                        finalResponse = await ProcessPromptDirectlyAsync(runningServer, prompt, markdownConfig, executionSummary);
+                    }
+                    
+                    FormatAndDisplayFinalResponse(finalResponse, executionSummary);
                 }
                 finally
                 {
@@ -291,7 +347,7 @@ public class RunCommand
         }
     }
 
-    private async Task<string> ProcessPromptWithAIAsync(McpServerInfo serverInfo, string userPrompt, Models.MarkdownConfig config)
+    private async Task<string> ProcessPromptWithAIAsync(McpServerInfo serverInfo, string userPrompt, Models.MarkdownConfig config, Models.ExecutionSummary executionSummary)
     {
         try
         {
@@ -304,12 +360,12 @@ public class RunCommand
             }
 
             // Step 2: Use AI to determine which tools to call and how
-            var aiPlanningPrompt = await GetAiPlanningPromptAsync(config, userPrompt, availableTools);
+            var aiPlanningPrompt = await _aiPlanningService!.GetAiPlanningPromptAsync(config, userPrompt, availableTools);
 
             var aiResponse = await _azureAiService.SendPromptAsync(aiPlanningPrompt);
             
             // Step 3: Parse AI response and execute tools
-            var toolResults = await ExecuteAIToolPlanAsync(serverInfo, aiResponse);
+            var toolResults = await _aiPlanningService!.ExecuteAIToolPlanAsync(serverInfo, aiResponse, config);
             
             // Step 4: Send results back to AI for final processing
             var finalPrompt = $@"
@@ -329,181 +385,240 @@ Please provide a helpful, natural language response to the user based on these r
         }
     }
 
-    private async Task<string> ExecuteAIToolPlanAsync(McpServerInfo serverInfo, string aiResponse)
+    private async Task<string> ProcessPromptDirectlyAsync(McpServerInfo serverInfo, string userPrompt, Models.MarkdownConfig config, Models.ExecutionSummary executionSummary)
     {
         try
         {
-            Console.WriteLine("AI Execution Plan:");
-            Console.WriteLine(aiResponse);
-            Console.WriteLine("\n--- Executing Plan ---\n");
-
-            var toolResults = new List<string>();
-            var contextLibrary = new Models.ContextLibrary(); // New generic context management
-            var lines = aiResponse.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+            Console.WriteLine("Executing prompt directly with MCP server and AI...");
             
-            string? currentToolName = null;
-            var currentParameters = new Dictionary<string, object>();
-            string? currentPurpose = null;
-            int currentStep = 0;
+            // Step 1: Get available tools from MCP server
+            var availableTools = await _mcpServerService.SendPromptAsync(serverInfo, userPrompt);
+            
+            if (availableTools.StartsWith("MCP server error"))
+            {
+                return availableTools;
+            }
+            
+            // Step 2: Use AI to understand the prompt and determine which tools to call
+            var aiPrompt = $@"
+User's request: {userPrompt}
 
-            var executedTools = new HashSet<string>(); // Track executed tools to avoid duplicates
+{availableTools}
+
+Please analyze the user's request and determine which tools to call with what parameters to fulfill their request.
+
+IMPORTANT RULES:
+1. Only use the EXACT tool names listed above. Do not make up tool names or use variations.
+2. Tool defaults are configured for common parameters. DO NOT provide placeholder values like '<YourValue>' or similar.
+3. Only specify parameters when you need to override a default or when no default exists.
+4. If a tool needs parameters but you don't know the specific values, call the tool without parameters - defaults will be used.
+
+To call a tool, respond with just the tool name, or the tool name followed by a colon and parameters.
+
+Examples:
+- To initialize Azure DevOps: initialize_azure_dev_ops_client
+- To get all projects: get_projects  
+- To get repositories for a project: get_repositories: projectName=MyProject
+- To get pull requests: get_pull_requests_by_creation_date: projectName=MyProject,repositoryName=MyRepo
+
+If you can answer the question without calling any tools, provide a direct answer.
+If you need to call multiple tools, list them one per line.
+";
+
+            var aiResponse = await _azureAiService.SendPromptAsync(aiPrompt);
+            
+            // Step 3: Parse AI response and execute any tools mentioned
+            var toolResults = new List<string>();
+            var lines = aiResponse.Split('\n', StringSplitOptions.RemoveEmptyEntries);
             
             foreach (var line in lines)
             {
                 var trimmedLine = line.Trim();
                 
-                // Look for step numbers to track context
-                if (trimmedLine.StartsWith("1.") || trimmedLine.StartsWith("2.") || trimmedLine.StartsWith("3.") || 
-                    trimmedLine.StartsWith("4.") || trimmedLine.StartsWith("5."))
+                // Skip empty lines and lines that look like instructions
+                if (string.IsNullOrEmpty(trimmedLine) || 
+                    trimmedLine.StartsWith("User's") || 
+                    trimmedLine.StartsWith("Available") ||
+                    trimmedLine.StartsWith("Examples:") ||
+                    trimmedLine.StartsWith("To ") ||
+                    trimmedLine.StartsWith("- To "))
+                    continue;
+                
+                string toolName;
+                string parametersText = "";
+                
+                if (trimmedLine.Contains(":"))
                 {
-                    currentStep = int.Parse(trimmedLine.Substring(0, 1));
+                    // Format: "toolname: param=value"
+                    var parts = trimmedLine.Split(':', 2);
+                    toolName = parts[0].Trim();
+                    parametersText = parts[1].Trim();
+                }
+                else
+                {
+                    // Format: just "toolname"
+                    toolName = trimmedLine;
                 }
                 
-                // Look for tool name (handle multiple formats)
-                if (trimmedLine.StartsWith("- Tool name:", StringComparison.OrdinalIgnoreCase) ||
-                    trimmedLine.StartsWith("- **Tool name**:", StringComparison.OrdinalIgnoreCase) ||
-                    trimmedLine.StartsWith("- **Tool Name**:", StringComparison.OrdinalIgnoreCase))
+                // Clean up tool name (remove bullet points, dashes, etc.)
+                toolName = toolName.TrimStart('-', '*', '•').Trim();
+                
+                // Validate tool name
+                if (IsInvalidToolName(toolName) || string.IsNullOrWhiteSpace(toolName))
                 {
-                    // Execute previous tool if we have one and haven't executed it yet
-                    if (!string.IsNullOrEmpty(currentToolName))
+                    _logger.LogWarning("Skipping invalid tool name: {ToolName}", toolName);
+                    continue;
+                }
+                
+                // Parse parameters
+                var parameters = ParseParameters(parametersText);
+                
+                // Filter out placeholder parameters that would override tool defaults
+                var filteredParameters = new Dictionary<string, object>();
+                foreach (var param in parameters)
+                {
+                    var value = param.Value?.ToString() ?? "";
+                    // Skip parameters with placeholder patterns
+                    if (!IsPlaceholderValue(value))
                     {
-                        var previousStep = currentStep; // Store the step number for the tool we're about to execute
-                        var toolKey = $"{previousStep}_{currentToolName}_{string.Join(",", currentParameters.Select(p => $"{p.Key}={p.Value}"))}";
-                        if (!executedTools.Contains(toolKey))
-                        {
-                            executedTools.Add(toolKey);
-                            await ExecuteToolFromPlan(serverInfo, currentToolName, currentParameters, currentPurpose, previousStep, toolResults, contextLibrary);
-                        }
+                        filteredParameters[param.Key] = param.Value ?? "";
                     }
-                    
-                    // Start new tool
-                    currentToolName = ExtractToolName(trimmedLine);
-                    currentParameters = new Dictionary<string, object>();
-                    currentPurpose = null;
+                    // Skip placeholder parameters silently
                 }
-                else if (trimmedLine.StartsWith("- Parameters:", StringComparison.OrdinalIgnoreCase) ||
-                         trimmedLine.StartsWith("- **Parameters**:", StringComparison.OrdinalIgnoreCase))
-                {
-                    var parametersText = ExtractParameters(trimmedLine);
-                    currentParameters = ParseParameters(parametersText, contextLibrary);
-                }
-                else if (trimmedLine.StartsWith("- Purpose:", StringComparison.OrdinalIgnoreCase) ||
-                         trimmedLine.StartsWith("- **Purpose**:", StringComparison.OrdinalIgnoreCase))
-                {
-                    currentPurpose = ExtractPurpose(trimmedLine);
-                }
+                parameters = filteredParameters;
+                
+                // Execute tool
+                Console.WriteLine($"Executing tool: {toolName}");
+                executionSummary.AddToolExecuted(toolName);
+                var toolResult = await _mcpServerService.CallToolAsync(serverInfo, toolName, parameters, config.ToolDefaults);
+                toolResults.Add($"{toolName}: {toolResult}");
             }
             
-            // Execute the last tool if we have one and haven't executed it yet
-            if (!string.IsNullOrEmpty(currentToolName))
+            // Step 4: If tools were executed, send results back to AI for final processing
+            if (toolResults.Count > 0)
             {
-                var toolKey = $"{currentStep}_{currentToolName}_{string.Join(",", currentParameters.Select(p => $"{p.Key}={p.Value}"))}";
-                if (!executedTools.Contains(toolKey))
-                {
-                    executedTools.Add(toolKey);
-                    await ExecuteToolFromPlan(serverInfo, currentToolName, currentParameters, currentPurpose, currentStep, toolResults, contextLibrary);
-                }
-            }
-            
-            if (toolResults.Count == 0)
-            {
-                return "No tools were executed based on the AI plan.";
-            }
-            
-            return string.Join("\n\n", toolResults);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error executing AI tool plan");
-            return $"Error executing tools: {ex.Message}";
-        }
-    }
+                var finalPrompt = $@"
+User's original request: {userPrompt}
 
-    private async Task ExecuteToolFromPlan(McpServerInfo serverInfo, string toolName, Dictionary<string, object> parameters, string? purpose, int stepNumber, List<string> toolResults, Models.ContextLibrary contextLibrary)
-    {
-        var stepContext = new Models.StepContext
-        {
-            StepNumber = stepNumber,
-            ToolName = toolName,
-            Parameters = new Dictionary<string, object>(parameters),
-            Purpose = purpose ?? string.Empty
-        };
+Tool execution results:
+{string.Join("\n", toolResults)}
 
-        try
-        {
-            Console.WriteLine($"Executing: {toolName}");
-            if (!string.IsNullOrEmpty(purpose))
-            {
-                Console.WriteLine($"Purpose: {purpose}");
-            }
-            
-            string result;
-            
-            // Check if this is a get_pull_request_description call with multiple PR IDs
-            if (toolName == "get_pull_request_description" && parameters.ContainsKey("_MULTIPLE_PR_IDS"))
-            {
-                var allPrIds = (List<string>)parameters["_MULTIPLE_PR_IDS"];
-                var allResults = new List<string>();
+Please provide a helpful, natural language response to the user based on these results.
+";
                 
-                Console.WriteLine($"Executing {toolName} for {allPrIds.Count} pull requests");
-                
-                foreach (var prId in allPrIds)
-                {
-                    // Create a copy of parameters with the current PR ID
-                    var prParameters = new Dictionary<string, object>(parameters);
-                    prParameters["pullRequestId"] = prId;
-                    prParameters.Remove("_MULTIPLE_PR_IDS"); // Remove the special key
-                    
-                    Console.WriteLine($"  Fetching description for PR #{prId}");
-                    
-                    try
-                    {
-                        var prResult = await _mcpServerService.CallToolAsync(serverInfo, toolName, prParameters);
-                        allResults.Add($"PR #{prId}: {prResult}");
-                        Console.WriteLine($"  Successfully fetched description for PR #{prId}");
-                    }
-                    catch (Exception prEx)
-                    {
-                        var prError = $"PR #{prId}: Error - {prEx.Message}";
-                        allResults.Add(prError);
-                        Console.WriteLine($"  Error fetching description for PR #{prId}: {prEx.Message}");
-                    }
-                }
-                
-                result = string.Join("\n\n", allResults);
+                return await _azureAiService.SendPromptAsync(finalPrompt);
             }
             else
             {
-                // Regular single tool call
-                var cleanParameters = new Dictionary<string, object>(parameters);
-                cleanParameters.Remove("_MULTIPLE_PR_IDS"); // Remove special key if present
-                
-                result = await _mcpServerService.CallToolAsync(serverInfo, toolName, cleanParameters);
+                // No tools were executed, return the AI's direct response
+                return aiResponse;
             }
-            
-            // Store the successful result in context
-            stepContext.RawResult = result;
-            stepContext.IsSuccess = true;
-            contextLibrary.AddStepResult(stepContext);
-            
-            // Add to tool results for final output
-            toolResults.Add($"{toolName}: {result}");
-            
-            Console.WriteLine($"Stored result for step {stepNumber}: {result.Substring(0, Math.Min(100, result.Length))}...");
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error executing tool {ToolName}", toolName);
-            var errorResult = $"{toolName}: Error - {ex.Message}";
+            _logger.LogError(ex, "Error processing prompt directly");
+            return $"Error processing request: {ex.Message}";
+        }
+    }
+
+
+
+
+
+
+
+    private bool IsInvalidToolName(string toolName)
+    {
+        if (string.IsNullOrWhiteSpace(toolName))
+            return true;
+
+        var lowerToolName = toolName.ToLower();
+        
+        // Check for placeholder patterns
+        if (toolName.Contains("[") || toolName.Contains("]") || 
+            toolName.Contains("{") || toolName.Contains("}"))
+            return true;
             
-            // Store the error result in context
-            stepContext.RawResult = errorResult;
-            stepContext.IsSuccess = false;
-            stepContext.ErrorMessage = ex.Message;
-            contextLibrary.AddStepResult(stepContext);
+        // Check for forbidden keywords
+        var forbiddenKeywords = new[]
+        {
+            "none",
+            "manual",
+            "determined dynamically",
+            "analyze_completeness",
+            "manual step",
+            "manual formatting",
+            "manual formatting based on retrieved data",
+            "manual analysis",
+            "analyze data",
+            "compile",
+            "aggregate",
+            "format",
+            "process manually"
+        };
+        
+        foreach (var keyword in forbiddenKeywords)
+        {
+            if (lowerToolName.Contains(keyword))
+                return true;
+        }
+        
+        // Check for parenthetical descriptions that indicate manual work
+        if (toolName.Contains("(") && (
+            lowerToolName.Contains("manual") || 
+            lowerToolName.Contains("based on") ||
+            lowerToolName.Contains("formatting") ||
+            lowerToolName.Contains("retrieved data")))
+            return true;
             
-            toolResults.Add(errorResult);
-            Console.WriteLine($"Stored error for step {stepNumber}: {ex.Message}");
+        return false;
+    }
+
+    private bool IsPlaceholderValue(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return false;
+
+        var lowerValue = value.ToLower();
+        
+        // Check for common placeholder patterns
+        if (value.Contains("<") && value.Contains(">"))
+            return true;
+            
+        if (value.Contains("[") && value.Contains("]"))
+            return true;
+            
+        if (value.Contains("{") && value.Contains("}"))
+            return true;
+        
+        // Check for common placeholder keywords
+        var placeholderKeywords = new[]
+        {
+            "your",
+            "replace",
+            "placeholder",
+            "example",
+            "sample",
+            "todo",
+            "tbd",
+            "to be determined"
+        };
+        
+        foreach (var keyword in placeholderKeywords)
+        {
+            if (lowerValue.Contains(keyword))
+                return true;
+        }
+            
+        return false;
+    }
+
+    private void RemoveSpecialParameters(Dictionary<string, object> parameters)
+    {
+        var specialKeys = parameters.Keys.Where(k => k.StartsWith("_")).ToList();
+        foreach (var key in specialKeys)
+        {
+            parameters.Remove(key);
         }
     }
 
@@ -568,7 +683,7 @@ Please provide a helpful, natural language response to the user based on these r
         }
     }
 
-    private Dictionary<string, object> ParseParameters(string parametersText, Models.ContextLibrary contextLibrary)
+        private Dictionary<string, object> ParseParameters(string parametersText)
     {
         var parameters = new Dictionary<string, object>();
         
@@ -590,74 +705,11 @@ Please provide a helpful, natural language response to the user based on these r
                 var key = keyValue[0].Trim();
                 var value = keyValue[1].Trim();
                 
-                // Handle dynamic values that reference previous step results
-                // Clean up the value by removing explanatory text in parentheses
-                var cleanValue = value;
+                // Simple cleanup: remove explanatory text in parentheses
                 var parenIndex = value.IndexOf('(');
                 if (parenIndex > 0)
                 {
-                    cleanValue = value.Substring(0, parenIndex).Trim();
-                    Console.WriteLine($"Cleaned parameter value from '{value}' to '{cleanValue}'");
-                }
-                
-                if (cleanValue.StartsWith("RESULT_FROM_STEP_", StringComparison.OrdinalIgnoreCase) ||
-                    cleanValue.StartsWith("PULL_REQUEST_ID_FROM_STEP_", StringComparison.OrdinalIgnoreCase))
-                {
-                    Console.WriteLine($"Processing dynamic value: {cleanValue}");
-                    
-                    // Try new context library first
-                    var resolvedValue = contextLibrary.ResolveVariable(cleanValue);
-                    if (!string.IsNullOrEmpty(resolvedValue))
-                    {
-                        Console.WriteLine($"Resolved '{cleanValue}' to: {resolvedValue}");
-                        value = resolvedValue;
-                    }
-                    else
-                    {
-                        // Fall back to legacy resolution for backward compatibility
-                        var stepNumber = ExtractStepNumber(cleanValue);
-                        if (stepNumber > 0)
-                        {
-                            var step = contextLibrary.GetStep(stepNumber);
-                            if (step != null)
-                            {
-                                Console.WriteLine($"Found step result for step {stepNumber}");
-                                
-                                // Determine what type of value to extract based on the dynamic value name
-                                if (cleanValue.Contains("COMPLETION_DATE") || cleanValue.Contains("CLOSED_DATE") || cleanValue.Contains("DATE"))
-                                {
-                                    Console.WriteLine("Extracting date from result");
-                                    if (step.ExtractedValues.ContainsKey("date"))
-                                    {
-                                        var extractedDate = step.ExtractedValues["date"].FirstOrDefault();
-                                        if (!string.IsNullOrEmpty(extractedDate))
-                                        {
-                                            value = extractedDate;
-                                        }
-                                    }
-                                }
-                                else if (cleanValue.Contains("PULL_REQUEST_ID"))
-                                {
-                                    Console.WriteLine("Extracting pull request IDs from result");
-                                    if (step.ExtractedValues.ContainsKey("id"))
-                                    {
-                                        var extractedIds = step.ExtractedValues["id"];
-                                        if (extractedIds.Count > 0)
-                                        {
-                                            // Store all IDs for multiple tool calls
-                                            parameters["_MULTIPLE_PR_IDS"] = extractedIds;
-                                            value = extractedIds[0]; // Use first ID for the initial call
-                                            Console.WriteLine($"Found {extractedIds.Count} pull request IDs, using first: {value}");
-                                        }
-                                    }
-                                }
-                            }
-                            else
-                            {
-                                Console.WriteLine($"No step result found for step {stepNumber}");
-                            }
-                        }
-                    }
+                    value = value.Substring(0, parenIndex).Trim();
                 }
                 
                 parameters[key] = value;
@@ -667,319 +719,363 @@ Please provide a helpful, natural language response to the user based on these r
         return parameters;
     }
 
-    private int ExtractStepNumber(string dynamicValue)
+    private void FormatAndDisplayFinalResponse(string response, Models.ExecutionSummary executionSummary)
     {
-        // Extract step number from "RESULT_FROM_STEP_2_COMPLETION_DATE" or "PULL_REQUEST_ID_FROM_STEP_3"
-        Console.WriteLine($"Extracting step number from: {dynamicValue}");
+        // Display execution summary first
+        DisplayExecutionSummary(executionSummary);
         
-        var parts = dynamicValue.Split('_');
+        // Then display the final response
+        if (string.IsNullOrWhiteSpace(response))
+        {
+            Console.WriteLine("\n🔍 No response received.");
+            return;
+        }
+
+        // Clean up the response
+        var cleanedResponse = CleanResponse(response);
         
-        // Handle different formats
-        if (dynamicValue.StartsWith("RESULT_FROM_STEP_", StringComparison.OrdinalIgnoreCase))
-        {
-            // Format: RESULT_FROM_STEP_2_COMPLETION_DATE
-            if (parts.Length >= 4 && int.TryParse(parts[3], out int stepNumber))
-            {
-                Console.WriteLine($"Extracted step number: {stepNumber}");
-                return stepNumber;
-            }
-        }
-        else if (dynamicValue.StartsWith("PULL_REQUEST_ID_FROM_STEP_", StringComparison.OrdinalIgnoreCase))
-        {
-            // Format: PULL_REQUEST_ID_FROM_STEP_3
-            if (parts.Length >= 6 && int.TryParse(parts[5], out int stepNumber))
-            {
-                Console.WriteLine($"Extracted step number: {stepNumber}");
-                return stepNumber;
-            }
-        }
+        // Display with nice formatting
+        Console.WriteLine();
+        Console.WriteLine("═══════════════════════════════════════════════════════════════");
+        Console.WriteLine("                            📋 RESULT                           ");
+        Console.WriteLine("═══════════════════════════════════════════════════════════════");
+        Console.WriteLine();
         
-        Console.WriteLine("Could not extract step number");
-        return 0;
-    }
-
-    private string ExtractDateFromResult(string result)
-    {
-        // Try to extract a date from the result JSON
-        try
+        // Check if it's an error response
+        if (IsErrorResponse(cleanedResponse))
         {
-            Console.WriteLine($"Extracting date from result: {result.Substring(0, Math.Min(200, result.Length))}...");
-            
-            // Look for common date patterns in the result
-            var datePatterns = new[]
-            {
-                @"""closedDate"":\s*""([^""]+)""", // JSON closedDate field
-                @"""completedDate"":\s*""([^""]+)""", // JSON completedDate field  
-                @"""creationDate"":\s*""([^""]+)""", // JSON creationDate field
-                @"""createdDate"":\s*""([^""]+)""", // JSON createdDate field
-                @"""lastMergeCommitDate"":\s*""([^""]+)""", // JSON lastMergeCommitDate field
-                @"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", // ISO datetime
-                @"\d{4}-\d{2}-\d{2}" // ISO date
-            };
-
-            foreach (var pattern in datePatterns)
-            {
-                var match = System.Text.RegularExpressions.Regex.Match(result, pattern);
-                if (match.Success)
-                {
-                    var dateValue = match.Groups.Count > 1 ? match.Groups[1].Value : match.Value;
-                    Console.WriteLine($"Found date pattern: {pattern} -> {dateValue}");
-                    
-                    // Convert to ISO date format if needed
-                    if (DateTime.TryParse(dateValue, out DateTime parsedDate))
-                    {
-                        var isoDate = parsedDate.ToString("yyyy-MM-dd");
-                        Console.WriteLine($"Converted to ISO date: {isoDate}");
-                        return isoDate;
-                    }
-                }
-            }
-            
-            Console.WriteLine("No date pattern matched in result");
+            Console.WriteLine("❌ Error:");
+            Console.WriteLine(FormatErrorMessage(cleanedResponse));
         }
-        catch (Exception ex)
+        else
         {
-            _logger.LogWarning(ex, "Failed to extract date from result: {Result}", result);
-        }
-        
-        return string.Empty;
-    }
-
-    private List<string> ExtractPullRequestIdsFromResult(string result)
-    {
-        var pullRequestIds = new List<string>();
-        
-        try
-        {
-            Console.WriteLine($"Extracting pull request IDs from result: {result.Substring(0, Math.Min(500, result.Length))}...");
-            
-            // First try to decode Unicode escapes
-            var decodedResult = System.Text.RegularExpressions.Regex.Unescape(result);
-            Console.WriteLine($"Decoded result: {decodedResult.Substring(0, Math.Min(500, decodedResult.Length))}...");
-            
-            // Try to parse as JSON first
-            try
+            // Format based on content type
+            if (IsJsonResponse(cleanedResponse))
             {
-                using var document = System.Text.Json.JsonDocument.Parse(decodedResult);
-                if (document.RootElement.TryGetProperty("content", out var contentArray) && contentArray.ValueKind == System.Text.Json.JsonValueKind.Array)
-                {
-                    foreach (var contentItem in contentArray.EnumerateArray())
-                    {
-                        if (contentItem.TryGetProperty("text", out var textProperty))
-                        {
-                            var textContent = textProperty.GetString();
-                            if (!string.IsNullOrEmpty(textContent))
-                            {
-                                // Parse the nested JSON in the text content
-                                try
-                                {
-                                    using var innerDocument = System.Text.Json.JsonDocument.Parse(textContent);
-                                    ExtractIdsFromJsonElement(innerDocument.RootElement, pullRequestIds);
-                                }
-                                catch (System.Text.Json.JsonException)
-                                {
-                                    // If inner JSON parsing fails, fall back to regex
-                                    ExtractIdsWithRegex(textContent, pullRequestIds);
-                                }
-                            }
-                        }
-                    }
-                }
+                Console.WriteLine("📊 Data:");
+                Console.WriteLine(FormatJsonResponse(cleanedResponse));
             }
-            catch (System.Text.Json.JsonException)
+            else if (IsMarkdownResponse(cleanedResponse))
             {
-                Console.WriteLine("JSON parsing failed, falling back to regex approach");
-                // Fall back to regex approach
-                ExtractIdsWithRegex(decodedResult, pullRequestIds);
-            }
-            
-            Console.WriteLine($"Extracted {pullRequestIds.Count} pull request IDs: {string.Join(", ", pullRequestIds)}");
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to extract pull request IDs from result: {Result}", result);
-        }
-        
-        return pullRequestIds;
-    }
-
-    private void ExtractIdsFromJsonElement(System.Text.Json.JsonElement element, List<string> pullRequestIds)
-    {
-        if (element.ValueKind == System.Text.Json.JsonValueKind.Object)
-        {
-            // Look for common PR ID field names
-            var idFields = new[] { "pullRequestId", "id", "PullRequestId", "Id" };
-            
-            foreach (var fieldName in idFields)
-            {
-                if (element.TryGetProperty(fieldName, out var idProperty) && idProperty.ValueKind == System.Text.Json.JsonValueKind.Number)
-                {
-                    var idValue = idProperty.GetInt32().ToString();
-                    Console.WriteLine($"Found PR ID in JSON field '{fieldName}': {idValue}");
-                    if (!pullRequestIds.Contains(idValue))
-                    {
-                        pullRequestIds.Add(idValue);
-                    }
-                }
-            }
-            
-            // Recursively search nested objects and arrays
-            foreach (var property in element.EnumerateObject())
-            {
-                ExtractIdsFromJsonElement(property.Value, pullRequestIds);
-            }
-        }
-        else if (element.ValueKind == System.Text.Json.JsonValueKind.Array)
-        {
-            foreach (var item in element.EnumerateArray())
-            {
-                ExtractIdsFromJsonElement(item, pullRequestIds);
-            }
-        }
-    }
-
-    private void ExtractIdsWithRegex(string text, List<string> pullRequestIds)
-    {
-        var idPatterns = new[]
-        {
-            @"""pullRequestId"":\s*(\d+)", // JSON pullRequestId field
-            @"""id"":\s*(\d+)", // JSON id field
-            @"""PullRequestId"":\s*(\d+)", // JSON PullRequestId field (capitalized)
-            @"""Id"":\s*(\d+)", // JSON Id field (capitalized)
-            @"#(\d+)", // PR reference like #12345
-            @"PR\s*(\d+)", // PR reference like PR 12345
-            @"Pull\s*Request\s*(\d+)" // Pull Request 12345
-        };
-
-        foreach (var pattern in idPatterns)
-        {
-            var matches = System.Text.RegularExpressions.Regex.Matches(text, pattern);
-            foreach (System.Text.RegularExpressions.Match match in matches)
-            {
-                if (match.Groups.Count > 1)
-                {
-                    var idValue = match.Groups[1].Value;
-                    Console.WriteLine($"Found PR ID with regex pattern '{pattern}': {idValue}");
-                    
-                    if (!pullRequestIds.Contains(idValue))
-                    {
-                        pullRequestIds.Add(idValue);
-                    }
-                }
-            }
-        }
-    }
-
-    private async Task<string> GetAiPlanningPromptAsync(Models.MarkdownConfig config, string userPrompt, string availableTools)
-    {
-        try
-        {
-            // Determine the AI planning prompt file path
-            string promptFilePath;
-            
-            if (!string.IsNullOrEmpty(config.AiPlanningPromptFile))
-            {
-                // Use configured prompt file (relative to config file or absolute)
-                promptFilePath = Path.IsPathRooted(config.AiPlanningPromptFile) 
-                    ? config.AiPlanningPromptFile 
-                    : Path.Combine(Path.GetDirectoryName(Environment.CurrentDirectory) ?? "", config.AiPlanningPromptFile);
+                Console.WriteLine("📝 Content:");
+                Console.WriteLine(FormatMarkdownResponse(cleanedResponse));
             }
             else
             {
-                // Use default system prompt
-                promptFilePath = Path.Combine(Path.GetDirectoryName(Environment.CurrentDirectory) ?? "", "system-prompts", "ai-planning-prompt.md");
+                Console.WriteLine("💬 Response:");
+                Console.WriteLine(FormatTextResponse(cleanedResponse));
             }
+        }
+        
+        Console.WriteLine();
+        Console.WriteLine("═══════════════════════════════════════════════════════════════");
+        Console.WriteLine();
+    }
 
-            // Check if the prompt file exists
-            if (await _systemPromptService.ValidatePromptFileAsync(promptFilePath))
+    private string CleanResponse(string response)
+    {
+        // Remove common unwanted patterns
+        var cleaned = response.Trim();
+        
+        // Remove leading/trailing quotes if present
+        if (cleaned.StartsWith("\"") && cleaned.EndsWith("\""))
+        {
+            cleaned = cleaned.Substring(1, cleaned.Length - 2);
+        }
+        
+        // Decode common escape sequences
+        cleaned = cleaned.Replace("\\n", "\n")
+                        .Replace("\\t", "\t")
+                        .Replace("\\\"", "\"")
+                        .Replace("\\\\", "\\");
+        
+        return cleaned;
+    }
+
+    private bool IsErrorResponse(string response)
+    {
+        var lowerResponse = response.ToLower();
+        return lowerResponse.Contains("error:") || 
+               lowerResponse.Contains("exception:") || 
+               lowerResponse.Contains("failed") ||
+               lowerResponse.StartsWith("error ") ||
+               lowerResponse.Contains("mcp server error");
+    }
+
+    private bool IsJsonResponse(string response)
+    {
+        var trimmed = response.Trim();
+        return (trimmed.StartsWith("{") && trimmed.EndsWith("}")) ||
+               (trimmed.StartsWith("[") && trimmed.EndsWith("]"));
+    }
+
+    private bool IsMarkdownResponse(string response)
+    {
+        return response.Contains("##") || 
+               response.Contains("###") || 
+               response.Contains("**") || 
+               response.Contains("- ") ||
+               response.Contains("```");
+    }
+
+    private string FormatErrorMessage(string errorResponse)
+    {
+        var lines = errorResponse.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        var formatted = new List<string>();
+        
+        foreach (var line in lines)
+        {
+            formatted.Add($"   {line.Trim()}");
+        }
+        
+        return string.Join("\n", formatted);
+    }
+
+    private string FormatJsonResponse(string jsonResponse)
+    {
+        try
+        {
+            // Try to format JSON nicely
+            var parsed = System.Text.Json.JsonDocument.Parse(jsonResponse);
+            var formatted = System.Text.Json.JsonSerializer.Serialize(parsed, new System.Text.Json.JsonSerializerOptions
             {
-                var variables = new Dictionary<string, string>
-                {
-                    ["USER_PROMPT"] = userPrompt,
-                    ["AVAILABLE_TOOLS"] = availableTools
-                };
+                WriteIndented = true
+            });
+            
+            var lines = formatted.Split('\n');
+            var indentedLines = lines.Select(line => $"   {line}");
+            return string.Join("\n", indentedLines);
+        }
+        catch
+        {
+            // If JSON parsing fails, just indent the raw text
+            var lines = jsonResponse.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+            var formatted = lines.Select(line => $"   {line.Trim()}");
+            return string.Join("\n", formatted);
+        }
+    }
 
-                var processedPrompt = await _systemPromptService.ProcessPromptAsync(promptFilePath, variables);
-                _logger.LogInformation("Using AI planning prompt from: {PromptFilePath}", promptFilePath);
-                return processedPrompt;
+    private string FormatMarkdownResponse(string markdownResponse)
+    {
+        var lines = markdownResponse.Split('\n');
+        var formatted = new List<string>();
+        
+        foreach (var line in lines)
+        {
+            var trimmedLine = line.Trim();
+            
+            if (trimmedLine.StartsWith("###"))
+            {
+                formatted.Add($"   🔸 {trimmedLine.Substring(3).Trim()}");
+            }
+            else if (trimmedLine.StartsWith("##"))
+            {
+                formatted.Add($"   📌 {trimmedLine.Substring(2).Trim()}");
+            }
+            else if (trimmedLine.StartsWith("#"))
+            {
+                formatted.Add($"   📍 {trimmedLine.Substring(1).Trim()}");
+            }
+            else if (trimmedLine.StartsWith("- "))
+            {
+                formatted.Add($"   • {trimmedLine.Substring(2).Trim()}");
+            }
+            else if (trimmedLine.StartsWith("* "))
+            {
+                formatted.Add($"   • {trimmedLine.Substring(2).Trim()}");
+            }
+            else if (trimmedLine.StartsWith("```"))
+            {
+                formatted.Add($"   {trimmedLine}");
+            }
+            else if (!string.IsNullOrWhiteSpace(trimmedLine))
+            {
+                formatted.Add($"   {trimmedLine}");
             }
             else
             {
-                _logger.LogWarning("AI planning prompt file not found or invalid: {PromptFilePath}, using fallback", promptFilePath);
+                formatted.Add("");
             }
         }
-        catch (Exception ex)
+        
+        return string.Join("\n", formatted);
+    }
+
+    private string FormatTextResponse(string textResponse)
+    {
+        var lines = textResponse.Split('\n');
+        var formatted = new List<string>();
+        
+        foreach (var line in lines)
         {
-            _logger.LogWarning(ex, "Error loading AI planning prompt file, using fallback");
+            var trimmedLine = line.Trim();
+            if (!string.IsNullOrWhiteSpace(trimmedLine))
+            {
+                // Word wrap long lines
+                if (trimmedLine.Length > 80)
+                {
+                    var wrapped = WrapText(trimmedLine, 77); // 77 to account for 3-space indent
+                    foreach (var wrappedLine in wrapped)
+                    {
+                        formatted.Add($"   {wrappedLine}");
+                    }
+                }
+                else
+                {
+                    formatted.Add($"   {trimmedLine}");
+                }
+            }
+            else
+            {
+                formatted.Add("");
+            }
+        }
+        
+        return string.Join("\n", formatted);
+    }
+
+    private List<string> WrapText(string text, int maxLength)
+    {
+        var result = new List<string>();
+        var words = text.Split(' ');
+        var currentLine = new List<string>();
+        var currentLength = 0;
+        
+        foreach (var word in words)
+        {
+            if (currentLength + word.Length + 1 <= maxLength)
+            {
+                currentLine.Add(word);
+                currentLength += word.Length + (currentLine.Count > 1 ? 1 : 0);
+            }
+            else
+            {
+                if (currentLine.Count > 0)
+                {
+                    result.Add(string.Join(" ", currentLine));
+                    currentLine.Clear();
+                }
+                currentLine.Add(word);
+                currentLength = word.Length;
+            }
+        }
+        
+        if (currentLine.Count > 0)
+        {
+            result.Add(string.Join(" ", currentLine));
+        }
+        
+        return result;
+    }
+
+    private void DisplayExecutionSummary(Models.ExecutionSummary executionSummary)
+    {
+        Console.WriteLine();
+        Console.WriteLine("═══════════════════════════════════════════════════════════════");
+        Console.WriteLine("                      📊 EXECUTION SUMMARY");
+        Console.WriteLine("═══════════════════════════════════════════════════════════════");
+        Console.WriteLine();
+
+        // Azure AI Information
+        if (!string.IsNullOrEmpty(executionSummary.AzureAiEndpoint))
+        {
+            Console.WriteLine($"🔗 Azure AI Endpoint: {executionSummary.AzureAiEndpoint}");
+        }
+        if (!string.IsNullOrEmpty(executionSummary.AzureAiModel))
+        {
+            Console.WriteLine($"🤖 AI Model: {executionSummary.AzureAiModel}");
         }
 
-        // Fallback to hardcoded prompt
-        return GetFallbackAiPlanningPrompt(userPrompt, availableTools);
+        // Execution Mode
+        if (!string.IsNullOrEmpty(executionSummary.ExecutionMode))
+        {
+            Console.WriteLine($"⚙️  Execution Mode: {executionSummary.ExecutionMode}");
+        }
+
+        Console.WriteLine($"🚀 Preview Features: {(executionSummary.PreviewFeaturesEnabled ? "Enabled" : "Disabled")}");
+
+        // Repositories
+        if (executionSummary.RepositoriesCloned.Count > 0)
+        {
+            Console.WriteLine();
+            Console.WriteLine("📁 Repositories Used:");
+            foreach (var repo in executionSummary.RepositoriesCloned)
+            {
+                Console.WriteLine($"   • {repo}");
+            }
+        }
+
+        // MCP Servers
+        if (executionSummary.McpServersUsed.Count > 0)
+        {
+            Console.WriteLine();
+            Console.WriteLine("🔌 MCP Servers:");
+            foreach (var server in executionSummary.McpServersUsed)
+            {
+                Console.WriteLine($"   • {server}");
+            }
+        }
+
+        // Tools Executed
+        if (executionSummary.ToolsExecuted.Count > 0)
+        {
+            Console.WriteLine();
+            Console.WriteLine("🔧 Tools Executed:");
+            foreach (var tool in executionSummary.ToolsExecuted)
+            {
+                Console.WriteLine($"   • {tool}");
+            }
+        }
+
+        // Files Read
+        var hasFiles = false;
+        if (executionSummary.ConfigurationFilesRead.Count > 0)
+        {
+            if (!hasFiles)
+            {
+                Console.WriteLine();
+                Console.WriteLine("📄 Files Read:");
+                hasFiles = true;
+            }
+            Console.WriteLine("   Configuration Files:");
+            foreach (var file in executionSummary.ConfigurationFilesRead)
+            {
+                Console.WriteLine($"     • {file}");
+            }
+        }
+
+        if (executionSummary.PromptFilesRead.Count > 0)
+        {
+            if (!hasFiles)
+            {
+                Console.WriteLine();
+                Console.WriteLine("📄 Files Read:");
+                hasFiles = true;
+            }
+            Console.WriteLine("   Prompt Files:");
+            foreach (var file in executionSummary.PromptFilesRead)
+            {
+                Console.WriteLine($"     • {file}");
+            }
+        }
+
+        if (executionSummary.OtherMarkdownFilesRead.Count > 0)
+        {
+            if (!hasFiles)
+            {
+                Console.WriteLine();
+                Console.WriteLine("📄 Files Read:");
+                hasFiles = true;
+            }
+            Console.WriteLine("   Other Markdown Files:");
+            foreach (var file in executionSummary.OtherMarkdownFilesRead)
+            {
+                Console.WriteLine($"     • {file}");
+            }
+        }
+
+        Console.WriteLine();
+        Console.WriteLine("═══════════════════════════════════════════════════════════════");
+        Console.WriteLine();
     }
-
-    private string GetFallbackAiPlanningPrompt(string userPrompt, string availableTools)
-    {
-        return $@"
-You are an AI assistant that helps users interact with MCP (Model Context Protocol) servers.
-
-User's request: {userPrompt}
-
-Available MCP tools: {availableTools}
-
-CRITICAL INSTRUCTIONS:
-1. You must analyze the user's request and create a COMPLETE execution plan
-2. If the request involves multiple sequential steps, you must plan ALL of them
-3. Each step that requires a tool call must follow the exact format shown below
-4. Parameters must be formatted as: key1=value1, key2=value2, key3=value3
-5. Use the exact tool names from the available tools list above
-6. Pay special attention to DATE CONSTRAINTS - if the request mentions ""before"" a specific date, you MUST include that constraint
-7. For sequential steps that depend on previous results, clearly indicate the dependency
-
-EXECUTION PLAN:
-1. [First action description]
-   - Tool name: [exact tool name from available tools]
-   - Parameters: [key1=value1, key2=value2, etc.]
-   - Purpose: [why this tool call is needed]
-
-2. [Second action description]
-   - Tool name: [exact tool name from available tools]
-   - Parameters: [key1=value1, key2=value2, etc.]
-   - Purpose: [why this tool call is needed]
-
-CRITICAL FORMAT REQUIREMENTS:
-- Use EXACTLY this format: ""- Tool name: toolname"" (no bold, no markdown)
-- Use EXACTLY this format: ""- Parameters: key1=value1, key2=value2""
-- Use EXACTLY this format: ""- Purpose: description""
-- Do NOT use **bold** formatting in the tool specification lines
-- Do NOT use backticks around tool names
-
-IMPORTANT DATE HANDLING:
-- If looking for items ""before"" a completion date, use: beforeClosedDate=2025-07-01
-- If looking for items ""after"" a completion date, use: afterClosedDate=2025-07-01
-- If looking for items ""before"" a creation date, use: beforeCreatedDate=2025-07-01
-- Always use ISO date format: YYYY-MM-DD
-- For completion date filtering, use: get_pull_requests_by_closed_date
-- For creation date filtering, use: get_pull_requests_by_creation_date
-- Check available tools list for exact parameter names
-
-Example for Azure DevOps workflow with date constraints:
-EXECUTION PLAN:
-1. Initialize Azure DevOps connection
-   - Tool name: initialize_azure_dev_ops_client
-   - Parameters: organizationUrl=https://dev.azure.com/dnceng
-   - Purpose: Enable access to Azure DevOps APIs
-
-2. Get latest production deployment before cutoff date
-   - Tool name: get_pull_requests_by_closed_date
-   - Parameters: projectName=internal, repositoryName=dotnet-helix-service, targetBranch=production, status=completed, beforeClosedDate=2025-07-01, maxCount=1
-   - Purpose: Find the most recent production deployment that was completed before the cutoff date
-
-3. Analyze recent main branch changes after production deployment
-   - Tool name: get_pull_requests_by_closed_date
-   - Parameters: projectName=internal, repositoryName=dotnet-helix-service, targetBranch=main, status=completed, afterClosedDate=RESULT_FROM_STEP_2_COMPLETION_DATE, maxCount=10
-   - Purpose: Find all changes merged to main after the production deployment completion date
-
-Create a complete plan that addresses the full user request. Make sure to include ALL necessary steps and handle date constraints properly.
-";
-    }
-} 
+}

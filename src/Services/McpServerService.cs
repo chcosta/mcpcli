@@ -222,8 +222,84 @@ public class McpServerService : IMcpServerService
                 return $"MCP server error: {response.Error.Message}";
             }
 
-            // Return the raw tools JSON for AI processing
-            return response.Result?.ToString() ?? "No tools available";
+            // Format the tools response for AI processing
+            if (response.Result != null)
+            {
+                var resultJson = JsonSerializer.Serialize(response.Result);
+                _logger.LogDebug("Raw tools response: {Response}", resultJson);
+                
+                try
+                {
+                    // Parse and format the MCP tools response for better AI understanding
+                    var toolsResponse = JsonSerializer.Deserialize<JsonElement>(resultJson);
+                    
+                    if (toolsResponse.TryGetProperty("tools", out var toolsArray) && toolsArray.ValueKind == JsonValueKind.Array)
+                    {
+                        var formattedTools = new List<string>();
+                        
+                        foreach (var tool in toolsArray.EnumerateArray())
+                        {
+                            if (tool.TryGetProperty("name", out var nameElement) && nameElement.ValueKind == JsonValueKind.String)
+                            {
+                                var toolName = nameElement.GetString();
+                                var description = tool.TryGetProperty("description", out var descElement) ? descElement.GetString() : "No description";
+                                
+                                var toolInfo = $"Tool: {toolName}";
+                                if (!string.IsNullOrEmpty(description))
+                                {
+                                    toolInfo += $" - {description}";
+                                }
+                                
+                                // Add parameter schema info if available
+                                if (tool.TryGetProperty("inputSchema", out var schemaElement))
+                                {
+                                    try
+                                    {
+                                        var schemaJson = JsonSerializer.Serialize(schemaElement);
+                                        var schema = JsonSerializer.Deserialize<JsonElement>(schemaJson);
+                                        
+                                        if (schema.TryGetProperty("properties", out var properties))
+                                        {
+                                            var paramNames = new List<string>();
+                                            foreach (var prop in properties.EnumerateObject())
+                                            {
+                                                paramNames.Add(prop.Name);
+                                            }
+                                            
+                                            if (paramNames.Count > 0)
+                                            {
+                                                toolInfo += $" (Parameters: {string.Join(", ", paramNames)})";
+                                            }
+                                        }
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        _logger.LogDebug(ex, "Error parsing schema for tool {ToolName}", toolName);
+                                    }
+                                }
+                                
+                                formattedTools.Add(toolInfo);
+                            }
+                        }
+                        
+                        var result = $"Available tools:\n{string.Join("\n", formattedTools)}";
+                        _logger.LogDebug("Formatted tools for AI: {FormattedTools}", result);
+                        return result;
+                    }
+                    else
+                    {
+                        return "No tools available - response does not contain 'tools' array";
+                    }
+                }
+                catch (JsonException ex)
+                {
+                    _logger.LogError(ex, "Error parsing tools response for AI processing");
+                    // Fall back to raw response
+                    return $"Available tools (raw): {resultJson}";
+                }
+            }
+
+            return "No tools available";
         }
         catch (Exception ex)
         {
@@ -234,15 +310,29 @@ public class McpServerService : IMcpServerService
 
     public async Task<string> CallToolAsync(McpServerInfo serverInfo, string toolName, Dictionary<string, object> parameters, CancellationToken cancellationToken = default)
     {
+        return await CallToolAsync(serverInfo, toolName, parameters, null, cancellationToken);
+    }
+
+    public async Task<string> CallToolAsync(McpServerInfo serverInfo, string toolName, Dictionary<string, object> parameters, Dictionary<string, Dictionary<string, object>>? toolDefaults, CancellationToken cancellationToken = default)
+    {
         try
         {
+            // Merge tool defaults with provided parameters
+            var mergedParameters = MergeToolDefaults(toolName, parameters, toolDefaults);
+            
+            // Convert string parameters to appropriate types for known parameter names
+            var convertedParameters = ConvertParameterTypes(mergedParameters);
+            
+            _logger.LogDebug("Calling tool {ToolName} with parameters: {Parameters}", toolName, JsonSerializer.Serialize(convertedParameters));
+
+            
             var toolRequest = new McpRequest
             {
                 Method = "tools/call",
                 Params = new
                 {
                     name = toolName,
-                    arguments = parameters
+                    arguments = convertedParameters
                 }
             };
 
@@ -250,16 +340,118 @@ public class McpServerService : IMcpServerService
             
             if (response.Error != null)
             {
+                _logger.LogError("Tool {ToolName} returned error: {ErrorCode} - {ErrorMessage}", toolName, response.Error.Code, response.Error.Message);
                 return $"Tool error: {response.Error.Message}";
             }
 
-            return response.Result?.ToString() ?? "No result returned";
+            var result = response.Result?.ToString() ?? "No result returned";
+            _logger.LogDebug("Tool {ToolName} returned result: {ResultLength} characters", toolName, result.Length);
+            
+            return result;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error calling tool {ToolName}", toolName);
+            _logger.LogError(ex, "Error calling tool {ToolName} with parameters {Parameters}", toolName, JsonSerializer.Serialize(parameters));
             return $"Error calling tool {toolName}: {ex.Message}";
         }
+    }
+
+    private Dictionary<string, object> MergeToolDefaults(string toolName, Dictionary<string, object> parameters, Dictionary<string, Dictionary<string, object>>? toolDefaults)
+    {
+        if (toolDefaults == null || !toolDefaults.TryGetValue(toolName, out var defaults))
+        {
+            return parameters;
+        }
+
+        var mergedParameters = new Dictionary<string, object>();
+        
+        // First, add all defaults
+        foreach (var kvp in defaults)
+        {
+            mergedParameters[kvp.Key] = kvp.Value;
+        }
+        
+        // Then, add/override with explicit parameters
+        foreach (var kvp in parameters)
+        {
+            mergedParameters[kvp.Key] = kvp.Value;
+        }
+
+        _logger.LogDebug("Merged tool defaults for {ToolName}: {DefaultsCount} defaults, {ParametersCount} explicit parameters", 
+            toolName, defaults.Count, parameters.Count);
+
+
+        return mergedParameters;
+    }
+
+    private Dictionary<string, object> ConvertParameterTypes(Dictionary<string, object> parameters)
+    {
+        var convertedParameters = new Dictionary<string, object>();
+        
+        // Common parameter names that should be integers
+        var integerParameters = new[]
+        {
+            "pullRequestId", "id", "requestId", "number", "count", "maxCount", "skip", "top", "port", "timeout"
+        };
+
+        // Common parameter names that should be booleans
+        var booleanParameters = new[]
+        {
+            "includeDeleted", "includeLinks", "includeWorkItems", "ascending", "descending", "enabled", "disabled"
+        };
+
+        foreach (var kvp in parameters)
+        {
+            var key = kvp.Key;
+            var value = kvp.Value;
+
+            // Skip null values entirely
+            if (value == null)
+            {
+                continue;
+            }
+
+            // Try to convert to integer if parameter name suggests it should be an integer
+            if (integerParameters.Contains(key, StringComparer.OrdinalIgnoreCase))
+            {
+                if (value is string stringValue && int.TryParse(stringValue, out int intValue))
+                {
+                    convertedParameters[key] = intValue;
+                    _logger.LogDebug("Converted parameter {Key} from string '{StringValue}' to integer {IntValue}", key, stringValue, intValue);
+                }
+                else if (value is int)
+                {
+                    convertedParameters[key] = value; // Already an integer
+                }
+                else
+                {
+                    convertedParameters[key] = value; // Keep original value if conversion fails
+                }
+            }
+            // Try to convert to boolean if parameter name suggests it should be a boolean
+            else if (booleanParameters.Contains(key, StringComparer.OrdinalIgnoreCase))
+            {
+                if (value is string stringValue && bool.TryParse(stringValue, out bool boolValue))
+                {
+                    convertedParameters[key] = boolValue;
+                    _logger.LogDebug("Converted parameter {Key} from string '{StringValue}' to boolean {BoolValue}", key, stringValue, boolValue);
+                }
+                else if (value is bool)
+                {
+                    convertedParameters[key] = value; // Already a boolean
+                }
+                else
+                {
+                    convertedParameters[key] = value; // Keep original value if conversion fails
+                }
+            }
+            else
+            {
+                convertedParameters[key] = value; // Keep original value
+            }
+        }
+
+        return convertedParameters;
     }
 
     public async Task<IEnumerable<string>> GetAvailableToolsAsync(McpServerInfo serverInfo, CancellationToken cancellationToken = default)
@@ -282,10 +474,45 @@ public class McpServerService : IMcpServerService
 
             if (response.Result != null)
             {
-                // Parse the tools list - this is a simplified implementation
+                // Parse the MCP tools response format
                 var resultJson = JsonSerializer.Serialize(response.Result);
-                // In a real implementation, you'd parse the actual MCP tools response format
-                return new[] { "tool1", "tool2" }; // Placeholder
+                _logger.LogDebug("Tools response: {Response}", resultJson);
+                
+                try
+                {
+                    // Parse the MCP tools/list response format
+                    var toolsResponse = JsonSerializer.Deserialize<JsonElement>(resultJson);
+                    
+                    if (toolsResponse.TryGetProperty("tools", out var toolsArray) && toolsArray.ValueKind == JsonValueKind.Array)
+                    {
+                        var toolNames = new List<string>();
+                        
+                        foreach (var tool in toolsArray.EnumerateArray())
+                        {
+                            if (tool.TryGetProperty("name", out var nameElement) && nameElement.ValueKind == JsonValueKind.String)
+                            {
+                                var toolName = nameElement.GetString();
+                                if (!string.IsNullOrEmpty(toolName))
+                                {
+                                    toolNames.Add(toolName);
+                                    _logger.LogDebug("Found tool: {ToolName}", toolName);
+                                }
+                            }
+                        }
+                        
+                        return toolNames;
+                    }
+                    else
+                    {
+                        _logger.LogWarning("Tools response does not contain expected 'tools' array");
+                        return Array.Empty<string>();
+                    }
+                }
+                catch (JsonException ex)
+                {
+                    _logger.LogError(ex, "Error parsing tools response JSON: {Response}", resultJson);
+                    return Array.Empty<string>();
+                }
             }
 
             return Array.Empty<string>();

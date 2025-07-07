@@ -1,6 +1,7 @@
 ---
 name: AI Release Notes
 description: .NET Engineering's Release Notes MCP server
+preview_features: false
 azure_ai:
   endpoint: "https://andya-ma8fyz00-eastus2.openai.azure.com/"
   api_key: "${azure_ai_api_key}"
@@ -14,11 +15,14 @@ mcp_server:
   environment:
     NODE_ENV: "production"
 variables:
-  working_directory: ".\\mcp-servers"
+  working_directory: "..\\.mcp-servers"
   timeout_seconds: 30
   azure_devops_org: "dnceng"
   azure_devops_project: "internal"
   use_managed_identity: true
+tool_defaults:
+  initialize_azure_dev_ops_client:
+    organizationUrl: "dnceng"
 ---
 
 # AI Release Notes

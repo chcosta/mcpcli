@@ -10,6 +10,8 @@ public class MarkdownConfig
     public List<string> DefaultPrompts { get; set; } = new();
     public Dictionary<string, string> Variables { get; set; } = new();
     public string AiPlanningPromptFile { get; set; } = string.Empty;
+    public bool PreviewFeatures { get; set; } = false;
+    public Dictionary<string, Dictionary<string, object>> ToolDefaults { get; set; } = new();
 }
 
 public class McpServerConfig

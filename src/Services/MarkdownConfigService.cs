@@ -119,6 +119,7 @@ public class MarkdownConfigService : IMarkdownConfigService
         var template = $@"---
 name: {name}
 description: {description}
+preview_features: false
 azure_ai:
   endpoint: ""${{AZURE_AI_ENDPOINT}}""
   api_key: ""${{AZURE_AI_API_KEY}}""
@@ -134,6 +135,11 @@ mcp_server:
 ai_planning_prompt_file: ""system-prompts/ai-planning-prompt.md""
 variables:
   custom_var: ""${{CUSTOM_VARIABLE:default-value}}""
+tool_defaults:
+  initialize_azure_dev_ops_client:
+    organizationUrl: ""dnceng""
+  get_repositories:
+    projectName: ""internal""
 ---
 
 # {name}
@@ -179,6 +185,24 @@ $env:AZURE_DEVOPS_PROJECT=""your-project""
 export AZURE_DEVOPS_ORG=""your-organization""
 export AZURE_DEVOPS_PROJECT=""your-project""
 ```
+
+## Tool Defaults
+
+The `tool_defaults` section allows you to specify default parameter values for MCP tools. These defaults are automatically applied when tools are called without those parameters explicitly provided.
+
+Example:
+```yaml
+tool_defaults:
+  initialize_azure_dev_ops_client:
+    organizationUrl: ""dnceng""
+  get_repositories:
+    projectName: ""internal""
+```
+
+With these defaults:
+- When you run ""initialize azure devops client"", it will automatically use organizationUrl=""dnceng""
+- When you run ""list repositories"", it will automatically use projectName=""internal""
+- Explicit parameters always override defaults
 
 ## Security Benefits
 
@@ -405,6 +429,7 @@ Current configuration values are included as variables for reference.
             // Simple YAML parsing - handles nested structure
             var lines = yamlContent.Split('\n', StringSplitOptions.RemoveEmptyEntries);
             string currentSection = "";
+            string currentToolName = "";
             
             foreach (var line in lines)
             {
@@ -421,8 +446,23 @@ Current configuration values are included as variables for reference.
                 // Check if this is a section header (no value after colon, or empty value)
                 if (string.IsNullOrEmpty(value))
                 {
-                    currentSection = key.ToLower();
-                    continue;
+                    if (currentSection == "tool_defaults")
+                    {
+                        // Within tool_defaults, this is a tool name
+                        currentToolName = key;
+                        if (!config.ToolDefaults.ContainsKey(currentToolName))
+                        {
+                            config.ToolDefaults[currentToolName] = new Dictionary<string, object>();
+                        }
+                        continue;
+                    }
+                    else
+                    {
+                        // This is a top-level section header
+                        currentSection = key.ToLower();
+                        currentToolName = ""; // Reset tool name when entering new section
+                        continue;
+                    }
                 }
 
                 // Handle top-level keys
@@ -439,6 +479,9 @@ Current configuration values are included as variables for reference.
                         break;
                     case "ai_planning_prompt_file":
                         config.AiPlanningPromptFile = value;
+                        break;
+                    case "preview_features":
+                        config.PreviewFeatures = bool.Parse(value);
                         break;
                 }
 
@@ -484,7 +527,15 @@ Current configuration values are included as variables for reference.
                 }
                 else if (currentSection == "variables")
                 {
-                    // Handle variables section if needed in the future
+                    config.Variables[key] = value;
+                }
+                else if (currentSection == "tool_defaults")
+                {
+                    // Handle tool_defaults section - parameters for the current tool
+                    if (!string.IsNullOrEmpty(currentToolName))
+                    {
+                        config.ToolDefaults[currentToolName][key] = value;
+                    }
                 }
 
                 // Also handle dot notation for backward compatibility
