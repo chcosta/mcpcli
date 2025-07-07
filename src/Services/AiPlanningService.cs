@@ -11,17 +11,20 @@ public class AiPlanningService : IAiPlanningService
     private readonly IMcpServerService _mcpServerService;
     private readonly IAzureAiService _azureAiService;
     private readonly ISystemPromptService _systemPromptService;
+    private readonly IMultiMcpServerService _multiMcpServerService;
 
     public AiPlanningService(
         ILogger<AiPlanningService> logger,
         IMcpServerService mcpServerService,
         IAzureAiService azureAiService,
-        ISystemPromptService systemPromptService)
+        ISystemPromptService systemPromptService,
+        IMultiMcpServerService multiMcpServerService)
     {
         _logger = logger;
         _mcpServerService = mcpServerService;
         _azureAiService = azureAiService;
         _systemPromptService = systemPromptService;
+        _multiMcpServerService = multiMcpServerService;
     }
 
     public async Task<string> ProcessPromptWithAIAsync(McpServerInfo serverInfo, string userPrompt, MarkdownConfig config)
@@ -1626,6 +1629,341 @@ Your job is to create plans that are detailed and intelligent enough to handle a
         foreach (var key in specialKeys)
         {
             parameters.Remove(key);
+        }
+    }
+
+    // Multi-server AI planning methods for Phase 3
+
+    public async Task<string> ProcessPromptWithMultiServerAIAsync(List<RunningServerInfo> runningServers, ServerToolMapping serverToolMapping, string userPrompt, MarkdownConfig config, ExecutionSummary executionSummary)
+    {
+        try
+        {
+            _logger.LogInformation("Processing prompt with multi-server AI planning across {ServerCount} servers", runningServers.Count);
+
+            // Step 1: Get AI planning prompt with multi-server tool discovery
+            var aiPlanningPrompt = await GetMultiServerAiPlanningPromptAsync(config, userPrompt, serverToolMapping);
+
+            // Step 2: Get AI execution plan
+            var aiResponse = await _azureAiService.SendPromptAsync(aiPlanningPrompt);
+            
+            // Step 3: Execute the plan across multiple servers
+            var toolResults = await ExecuteMultiServerToolPlanAsync(runningServers, serverToolMapping, aiResponse, config, executionSummary);
+            
+            // Step 4: Send results back to AI for final processing
+            var finalPrompt = $@"
+User's original request: {userPrompt}
+
+Tool execution results from multiple servers: {toolResults}
+
+Please provide a helpful, natural language response to the user based on these results.
+Consolidate information from different servers where appropriate.
+";
+
+            return await _azureAiService.SendPromptAsync(finalPrompt);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error processing prompt with multi-server AI");
+            return $"Error processing request across multiple servers: {ex.Message}";
+        }
+    }
+
+    public async Task<string> ExecuteMultiServerToolPlanAsync(List<RunningServerInfo> runningServers, ServerToolMapping serverToolMapping, string aiResponse, MarkdownConfig config, ExecutionSummary executionSummary)
+    {
+        try
+        {
+            Console.WriteLine("Multi-Server AI Execution Plan:");
+            Console.WriteLine(aiResponse);
+            Console.WriteLine($"\n--- Executing Plan Across {runningServers.Count} Servers ---\n");
+
+            var toolResults = new List<string>();
+            var contextLibrary = new Models.ContextLibrary();
+            var lines = aiResponse.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+            
+            string? currentToolName = null;
+            var currentParameters = new Dictionary<string, object>();
+            string? currentPurpose = null;
+            int currentStep = 0;
+            int previousStep = 0;
+
+            var executedTools = new HashSet<string>();
+            
+            foreach (var line in lines)
+            {
+                var trimmedLine = line.Trim();
+                
+                // Look for step numbers to track context
+                if (trimmedLine.StartsWith("Step ") || trimmedLine.StartsWith("step "))
+                {
+                    var stepMatch = System.Text.RegularExpressions.Regex.Match(trimmedLine, @"(?i)step\s+(\d+)");
+                    if (stepMatch.Success)
+                    {
+                        previousStep = currentStep;
+                        currentStep = int.Parse(stepMatch.Groups[1].Value);
+                    }
+                }
+                else if (System.Text.RegularExpressions.Regex.IsMatch(trimmedLine, @"^\d+\."))
+                {
+                    var numberMatch = System.Text.RegularExpressions.Regex.Match(trimmedLine, @"^(\d+)\.");
+                    if (numberMatch.Success)
+                    {
+                        previousStep = currentStep;
+                        currentStep = int.Parse(numberMatch.Groups[1].Value);
+                    }
+                }
+                
+                // Look for tool name
+                if (trimmedLine.StartsWith("- Tool name:", StringComparison.OrdinalIgnoreCase) ||
+                    trimmedLine.StartsWith("- **Tool name**:", StringComparison.OrdinalIgnoreCase) ||
+                    trimmedLine.StartsWith("- **Tool Name**:", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Execute previous tool if we have one
+                    if (!string.IsNullOrEmpty(currentToolName))
+                    {
+                        var stepNumberForExecution = previousStep > 0 ? previousStep : currentStep - 1;
+                        var toolKey = $"{stepNumberForExecution}_{currentToolName}_{string.Join(",", currentParameters.Select(p => $"{p.Key}={p.Value}"))}";
+                        if (!executedTools.Contains(toolKey))
+                        {
+                            executedTools.Add(toolKey);
+                            await ExecuteMultiServerToolFromPlan(runningServers, serverToolMapping, currentToolName, currentParameters, currentPurpose, stepNumberForExecution, toolResults, contextLibrary, config, executionSummary);
+                        }
+                    }
+                    
+                    // Start new tool
+                    currentToolName = ExtractToolName(trimmedLine);
+                    
+                    if (!string.IsNullOrEmpty(currentToolName) && IsInvalidToolName(currentToolName))
+                    {
+                        Console.WriteLine($"Skipping invalid tool name: {currentToolName}");
+                        currentToolName = string.Empty;
+                        continue;
+                    }
+                    
+                    currentParameters = new Dictionary<string, object>();
+                    currentPurpose = null;
+                }
+                else if (trimmedLine.StartsWith("- Parameters:", StringComparison.OrdinalIgnoreCase) ||
+                         trimmedLine.StartsWith("- **Parameters**:", StringComparison.OrdinalIgnoreCase))
+                {
+                    var parametersText = ExtractParameters(trimmedLine);
+                    currentParameters = ParseParameters(parametersText, contextLibrary);
+                }
+                else if (trimmedLine.StartsWith("- Purpose:", StringComparison.OrdinalIgnoreCase) ||
+                         trimmedLine.StartsWith("- **Purpose**:", StringComparison.OrdinalIgnoreCase))
+                {
+                    currentPurpose = ExtractPurpose(trimmedLine);
+                }
+            }
+            
+            // Execute final tool if needed
+            if (!string.IsNullOrEmpty(currentToolName))
+            {
+                var stepNumberForExecution = previousStep > 0 ? previousStep : currentStep;
+                var toolKey = $"{stepNumberForExecution}_{currentToolName}_{string.Join(",", currentParameters.Select(p => $"{p.Key}={p.Value}"))}";
+                if (!executedTools.Contains(toolKey))
+                {
+                    await ExecuteMultiServerToolFromPlan(runningServers, serverToolMapping, currentToolName, currentParameters, currentPurpose, stepNumberForExecution, toolResults, contextLibrary, config, executionSummary);
+                }
+            }
+
+            return string.Join("\n\n", toolResults);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error executing multi-server tool plan");
+            return $"Error executing tool plan: {ex.Message}";
+        }
+    }
+
+    public async Task<string> GetMultiServerAiPlanningPromptAsync(MarkdownConfig config, string userPrompt, ServerToolMapping serverToolMapping)
+    {
+        try
+        {
+            // Build comprehensive tool list with server information
+            var toolsWithServerInfo = BuildToolsWithServerInfo(serverToolMapping);
+            
+            // Load custom prompt if specified
+            if (!string.IsNullOrEmpty(config.AiPlanningPromptFile))
+            {
+                var promptFilePath = FindSystemPromptFile(config.AiPlanningPromptFile);
+                if (!string.IsNullOrEmpty(promptFilePath))
+                {
+                    var customPrompt = await _systemPromptService.LoadPromptAsync(promptFilePath);
+                    if (!string.IsNullOrEmpty(customPrompt))
+                    {
+                        // Enhance custom prompt with multi-server context
+                        return customPrompt.Replace("AVAILABLE_TOOLS_PLACEHOLDER", toolsWithServerInfo)
+                                         .Replace("USER_PROMPT_PLACEHOLDER", userPrompt);
+                    }
+                }
+            }
+            
+            // Use enhanced fallback prompt for multi-server
+            return GetEnhancedMultiServerAiPlanningPrompt(userPrompt, toolsWithServerInfo, serverToolMapping);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting multi-server AI planning prompt");
+            return GetEnhancedMultiServerAiPlanningPrompt(userPrompt, "Error loading tools", serverToolMapping);
+        }
+    }
+
+    private string BuildToolsWithServerInfo(ServerToolMapping serverToolMapping)
+    {
+        var toolsInfo = new List<string>();
+        
+        foreach (var tool in serverToolMapping.AllTools)
+        {
+            var serverName = serverToolMapping.ToolToServer.GetValueOrDefault(tool, "unknown");
+            var serverInfo = $"[Server: {serverName}]";
+            
+            // Check for conflicts
+            if (serverToolMapping.ConflictingTools.ContainsKey(tool))
+            {
+                var conflictServers = string.Join(", ", serverToolMapping.ConflictingTools[tool]);
+                serverInfo = $"[Available on: {conflictServers}]";
+            }
+            
+            var description = serverToolMapping.ToolDescriptions.GetValueOrDefault(tool, "");
+            if (!string.IsNullOrEmpty(description))
+            {
+                toolsInfo.Add($"- {tool} {serverInfo}: {description}");
+            }
+            else
+            {
+                toolsInfo.Add($"- {tool} {serverInfo}");
+            }
+        }
+        
+        return string.Join("\n", toolsInfo);
+    }
+
+    private string GetEnhancedMultiServerAiPlanningPrompt(string userPrompt, string toolsWithServerInfo, ServerToolMapping serverToolMapping)
+    {
+        var conflictInfo = "";
+        if (serverToolMapping.ConflictingTools.Count > 0)
+        {
+            var conflicts = serverToolMapping.ConflictingTools.Select(c => 
+                $"  - {c.Key}: Available on {string.Join(", ", c.Value)}");
+            conflictInfo = $@"
+
+TOOL CONFLICTS DETECTED:
+The following tools are available on multiple servers:
+{string.Join("\n", conflicts)}
+
+When using conflicting tools, the system will automatically route to the primary server unless you specify otherwise.
+";
+        }
+
+        return $@"
+You are an AI assistant that helps users accomplish tasks by creating detailed execution plans using available MCP (Model Context Protocol) tools across multiple servers.
+
+AVAILABLE TOOLS ACROSS SERVERS:
+{toolsWithServerInfo}
+
+{conflictInfo}
+
+MULTI-SERVER EXECUTION RULES:
+1. Tools are automatically routed to the appropriate server
+2. Use tools from different servers as needed - the system handles routing
+3. Consider data locality - prefer tools from the same server when working with related data
+4. Tool defaults are configured per-server and applied automatically
+5. Server health is monitored - failed servers will be skipped
+
+USER'S REQUEST: {userPrompt}
+
+Create a detailed, step-by-step execution plan using the available tools. For each step, provide:
+
+- Tool name: [exact tool name from the list above]
+- Parameters: [specific parameters - use tool defaults when appropriate]
+- Purpose: [what this step accomplishes]
+
+IMPORTANT FORMATTING REQUIREMENTS:
+1. Use EXACT tool names from the list above
+2. Format each step as shown above with dashes and colons
+3. Use clear, numbered steps (Step 1, Step 2, etc.)
+4. Don't invent tools that aren't in the list
+5. Don't use placeholder values - tool defaults will be applied automatically
+
+Example format:
+Step 1: Initialize connection
+- Tool name: initialize_azure_dev_ops_client
+- Parameters: organizationUrl=myorg
+- Purpose: Connect to Azure DevOps for subsequent operations
+
+Your execution plan should be comprehensive and handle the user's request completely using the available tools across all servers.
+";
+    }
+
+    private async Task ExecuteMultiServerToolFromPlan(List<RunningServerInfo> runningServers, ServerToolMapping serverToolMapping, string toolName, Dictionary<string, object> parameters, string? purpose, int stepNumber, List<string> toolResults, ContextLibrary contextLibrary, MarkdownConfig config, ExecutionSummary executionSummary)
+    {
+        var stepContext = new StepContext
+        {
+            StepNumber = stepNumber,
+            ToolName = toolName,
+            Parameters = new Dictionary<string, object>(parameters),
+            Purpose = purpose ?? string.Empty
+        };
+
+        try
+        {
+            Console.WriteLine($"Executing: {toolName}");
+            if (!string.IsNullOrEmpty(purpose))
+            {
+                Console.WriteLine($"Purpose: {purpose}");
+            }
+            
+            // Find which server hosts this tool
+            if (!serverToolMapping.ToolToServer.TryGetValue(toolName, out var serverName))
+            {
+                throw new InvalidOperationException($"Tool '{toolName}' not found on any server");
+            }
+
+            var targetServer = runningServers.FirstOrDefault(s => s.Name == serverName);
+            if (targetServer == null)
+            {
+                throw new InvalidOperationException($"Server '{serverName}' not found or not running");
+            }
+
+            Console.WriteLine($"Routing to server: {serverName}");
+            
+            // Debug: Show all parameters being passed
+            Console.WriteLine($"Parameters being passed to {toolName}:");
+            foreach (var param in parameters)
+            {
+                Console.WriteLine($"  {param.Key} = {param.Value}");
+            }
+            
+            // Track tool execution
+            executionSummary.AddToolExecuted(toolName);
+            executionSummary.AddMcpServerUsed(serverName);
+            
+            // Execute the tool via the multi-server service
+            var result = await _multiMcpServerService.CallToolAsync(toolName, parameters, runningServers, serverToolMapping, executionSummary);
+            
+            // Store the successful result in context
+            stepContext.RawResult = result;
+            stepContext.IsSuccess = true;
+            contextLibrary.AddStepResult(stepContext);
+            
+            // Add to tool results for final output
+            toolResults.Add($"{toolName} (on {serverName}): {result}");
+            
+            Console.WriteLine($"Stored result for step {stepNumber}: {result.Substring(0, Math.Min(100, result.Length))}...");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error executing tool {ToolName} in multi-server environment", toolName);
+            var errorResult = $"{toolName}: Error - {ex.Message}";
+            
+            // Store the error result in context
+            stepContext.RawResult = errorResult;
+            stepContext.IsSuccess = false;
+            stepContext.ErrorMessage = ex.Message;
+            contextLibrary.AddStepResult(stepContext);
+            
+            toolResults.Add(errorResult);
+            Console.WriteLine($"Stored error for step {stepNumber}: {ex.Message}");
         }
     }
 } 

@@ -2,6 +2,7 @@ using System.Text.RegularExpressions;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using McpCli.Models;
+using System.Text;
 
 namespace McpCli.Services;
 
@@ -94,10 +95,38 @@ public class MarkdownConfigService : IMarkdownConfigService
                 return false;
             }
 
-            if (string.IsNullOrEmpty(config.RepositoryUrl))
+            // Validate server configuration
+            if (config.Servers.Count == 0)
             {
-                _logger.LogWarning("Repository URL is required");
+                _logger.LogWarning("At least one server must be configured");
                 return false;
+            }
+
+            foreach (var server in config.Servers)
+            {
+                if (string.IsNullOrEmpty(server.Name))
+                {
+                    _logger.LogWarning("Server name is required");
+                    return false;
+                }
+
+                if (string.IsNullOrEmpty(server.Type))
+                {
+                    _logger.LogWarning($"Server type is required for server '{server.Name}'");
+                    return false;
+                }
+
+                if (server.Type != "git" && server.Type != "http")
+                {
+                    _logger.LogWarning($"Server type must be 'git' or 'http' for server '{server.Name}'");
+                    return false;
+                }
+
+                if (string.IsNullOrEmpty(server.Url))
+                {
+                    _logger.LogWarning($"Server URL is required for server '{server.Name}'");
+                    return false;
+                }
             }
 
             return true;
@@ -126,15 +155,44 @@ azure_ai:
   deployment_name: ""${{AZURE_AI_DEPLOYMENT_NAME}}""
   model_name: ""${{AZURE_AI_MODEL_NAME:gpt-4}}""
   use_managed_identity: false
-repository_url: ""https://dev.azure.com/${{AZURE_DEVOPS_ORG}}/${{AZURE_DEVOPS_PROJECT}}/_git/your-mcp-server""
-mcp_server:
-  port: 3000
-  auto_start: true
-  environment:
-    NODE_ENV: ""production""
+
+# MCP Servers Configuration
+servers:
+  - name: ""primary-server""
+    type: ""git""
+    url: ""https://dev.azure.com/${{AZURE_DEVOPS_ORG}}/${{AZURE_DEVOPS_PROJECT}}/_git/your-mcp-server""
+    description: ""Primary MCP server""
+    enabled: true
+    auto_start: true
+    port: 3000
+    tags: [""primary""]
+    tool_defaults:
+      initialize_azure_dev_ops_client:
+        organizationUrl: ""dnceng""
+      get_repositories:
+        projectName: ""internal""
+  - name: ""external-api""
+    type: ""http""
+    url: ""https://api.example.com/mcp""
+    description: ""External API server""
+    enabled: true
+    headers:
+      Authorization: ""Bearer ${{EXTERNAL_API_TOKEN}}""
+    tags: [""external""]
+  - name: ""disabled-server""
+    type: ""git""
+    url: ""https://github.com/example/disabled-server""
+    description: ""Disabled server for testing""
+    enabled: false
+    auto_start: false
+    port: 3001
+    tags: [""testing"", ""disabled""]
+
 ai_planning_prompt_file: ""system-prompts/ai-planning-prompt.md""
 variables:
   custom_var: ""${{CUSTOM_VARIABLE:default-value}}""
+
+# Global tool defaults (applies to all servers)
 tool_defaults:
   initialize_azure_dev_ops_client:
     organizationUrl: ""dnceng""
@@ -400,25 +458,221 @@ Current configuration values are included as variables for reference.
     {
         try
         {
-            var template = await GenerateTemplateAsync(config.Name, config.Description);
+            var yamlContent = SerializeToYaml(config);
+            var markdownContent = ExtractMarkdownContent(filePath);
             
-            // Replace template values with actual config values
-            template = template.Replace("\"https://your-resource.openai.azure.com/\"", $"\"{config.AzureAi.Endpoint}\"");
-            template = template.Replace("\"your-api-key\"", $"\"{config.AzureAi.ApiKey}\"");
-            template = template.Replace("\"your-deployment\"", $"\"{config.AzureAi.DeploymentName}\"");
-            template = template.Replace("\"gpt-4\"", $"\"{config.AzureAi.ModelName}\"");
-            template = template.Replace("false", config.AzureAi.UseManagedIdentity.ToString().ToLower());
-            template = template.Replace("\"https://dev.azure.com/your-org/your-project/_git/your-mcp-server\"", $"\"{config.RepositoryUrl}\"");
-            template = template.Replace("3000", config.McpServer.Port.ToString());
-            template = template.Replace("true", config.McpServer.AutoStart.ToString().ToLower());
-
-            await File.WriteAllTextAsync(filePath, template);
+            var fullContent = $"---\n{yamlContent}\n---\n\n{markdownContent}";
+            await File.WriteAllTextAsync(filePath, fullContent);
+            
             _logger.LogInformation("Markdown configuration saved to {FilePath}", filePath);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error saving markdown config to {FilePath}", filePath);
             throw;
+        }
+    }
+
+    private string SerializeToYaml(MarkdownConfig config)
+    {
+        var yaml = new StringBuilder();
+        
+        // Basic properties
+        yaml.AppendLine($"name: {EscapeYamlValue(config.Name)}");
+        yaml.AppendLine($"description: {EscapeYamlValue(config.Description)}");
+        yaml.AppendLine($"preview_features: {config.PreviewFeatures.ToString().ToLower()}");
+        
+        // Azure AI configuration
+        yaml.AppendLine("azure_ai:");
+        yaml.AppendLine($"  endpoint: {EscapeYamlValue(config.AzureAi.Endpoint)}");
+        yaml.AppendLine($"  api_key: {PreserveEnvironmentVariableFormat("api_key", config.AzureAi.ApiKey)}");
+        yaml.AppendLine($"  deployment_name: {EscapeYamlValue(config.AzureAi.DeploymentName)}");
+        yaml.AppendLine($"  model_name: {EscapeYamlValue(config.AzureAi.ModelName)}");
+        yaml.AppendLine($"  use_managed_identity: {config.AzureAi.UseManagedIdentity.ToString().ToLower()}");
+        
+        // Servers configuration
+        if (config.Servers.Count > 0)
+        {
+            yaml.AppendLine();
+            yaml.AppendLine("# MCP Servers Configuration");
+            yaml.AppendLine("servers:");
+            
+            foreach (var server in config.Servers)
+            {
+                yaml.AppendLine($"  - name: {EscapeYamlValue(server.Name)}");
+                yaml.AppendLine($"    type: {EscapeYamlValue(server.Type)}");
+                yaml.AppendLine($"    url: {EscapeYamlValue(server.Url)}");
+                yaml.AppendLine($"    description: {EscapeYamlValue(server.Description)}");
+                yaml.AppendLine($"    enabled: {server.Enabled.ToString().ToLower()}");
+                yaml.AppendLine($"    auto_start: {server.AutoStart.ToString().ToLower()}");
+                yaml.AppendLine($"    port: {server.Port}");
+                
+                if (server.Tags.Count > 0)
+                {
+                    yaml.AppendLine($"    tags: [{string.Join(", ", server.Tags.Select(EscapeYamlValue))}]");
+                }
+                
+                if (server.Environment.Count > 0)
+                {
+                    yaml.AppendLine("    environment:");
+                    foreach (var env in server.Environment)
+                    {
+                        yaml.AppendLine($"      {env.Key}: {EscapeYamlValue(env.Value)}");
+                    }
+                }
+                
+                if (server.Headers.Count > 0)
+                {
+                    yaml.AppendLine("    headers:");
+                    foreach (var header in server.Headers)
+                    {
+                        yaml.AppendLine($"      {header.Key}: {EscapeYamlValue(header.Value)}");
+                    }
+                }
+                
+                if (!string.IsNullOrEmpty(server.StartCommand))
+                {
+                    yaml.AppendLine($"    start_command: {EscapeYamlValue(server.StartCommand)}");
+                }
+                
+                if (!string.IsNullOrEmpty(server.StartArguments))
+                {
+                    yaml.AppendLine($"    start_arguments: {EscapeYamlValue(server.StartArguments)}");
+                }
+                
+                if (!string.IsNullOrEmpty(server.AuthToken))
+                {
+                    yaml.AppendLine($"    auth_token: {PreserveEnvironmentVariableFormat("auth_token", server.AuthToken)}");
+                }
+                
+                if (!string.IsNullOrEmpty(server.AuthType))
+                {
+                    yaml.AppendLine($"    auth_type: {EscapeYamlValue(server.AuthType)}");
+                }
+                
+                if (server.ToolDefaults.Count > 0)
+                {
+                    yaml.AppendLine("    tool_defaults:");
+                    foreach (var toolDefault in server.ToolDefaults)
+                    {
+                        yaml.AppendLine($"      {toolDefault.Key}:");
+                        foreach (var param in toolDefault.Value)
+                        {
+                            yaml.AppendLine($"        {param.Key}: {EscapeYamlValue(param.Value.ToString())}");
+                        }
+                    }
+                }
+            }
+        }
+        
+        // AI planning prompt file
+        if (!string.IsNullOrEmpty(config.AiPlanningPromptFile))
+        {
+            yaml.AppendLine($"ai_planning_prompt_file: {EscapeYamlValue(config.AiPlanningPromptFile)}");
+        }
+        
+        // Variables
+        if (config.Variables.Count > 0)
+        {
+            yaml.AppendLine("variables:");
+            foreach (var variable in config.Variables)
+            {
+                yaml.AppendLine($"  {variable.Key}: {EscapeYamlValue(variable.Value)}");
+            }
+        }
+        
+        // Global tool defaults
+        if (config.ToolDefaults.Count > 0)
+        {
+            yaml.AppendLine();
+            yaml.AppendLine("# Global tool defaults (applies to all servers)");
+            yaml.AppendLine("tool_defaults:");
+            foreach (var toolDefault in config.ToolDefaults)
+            {
+                yaml.AppendLine($"  {toolDefault.Key}:");
+                foreach (var param in toolDefault.Value)
+                {
+                    yaml.AppendLine($"    {param.Key}: {EscapeYamlValue(param.Value.ToString())}");
+                }
+            }
+        }
+        
+        return yaml.ToString();
+    }
+
+    private string EscapeYamlValue(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return "\"\"";
+            
+        // If value contains special characters, quote it
+        if (value.Contains(":") || value.Contains("'") || value.Contains("\"") || 
+            value.Contains("\n") || value.Contains("\r") || value.Contains("\t") ||
+            value.StartsWith("$") || value.StartsWith("%") || value.Contains("${"))
+        {
+            return $"\"{value.Replace("\"", "\\\"")}\"";
+        }
+        
+        return value;
+    }
+
+    private string PreserveEnvironmentVariableFormat(string key, string value)
+    {
+        // For sensitive fields, try to preserve environment variable format
+        if (IsSensitiveField(key))
+        {
+            // If the value looks like it might be an actual resolved value (long, no spaces, base64-like)
+            // and we're dealing with a sensitive field, use a placeholder format
+            if (value.Length > 30 && !value.Contains(" ") && !value.Contains("${") && !value.Contains("%"))
+            {
+                // Convert to environment variable format based on field name
+                var envVarName = ConvertToEnvironmentVariableName(key);
+                return $"\"${{{envVarName}}}\"";
+            }
+        }
+        
+        return EscapeYamlValue(value);
+    }
+
+    private bool IsSensitiveField(string key)
+    {
+        var sensitiveFields = new[] { "api_key", "apikey", "token", "password", "secret", "auth_token" };
+        return sensitiveFields.Any(field => key.ToLower().Contains(field));
+    }
+
+    private string ConvertToEnvironmentVariableName(string key)
+    {
+        // Convert field names to environment variable names
+        return key.ToLower() switch
+        {
+            "api_key" => "azure_ai_api_key",
+            "auth_token" => "auth_token",
+            "password" => "password",
+            _ => key.ToLower().Replace(".", "_")
+        };
+    }
+
+    private string ExtractMarkdownContent(string filePath)
+    {
+        try
+        {
+            if (!File.Exists(filePath))
+                return "";
+                
+            var content = File.ReadAllText(filePath);
+            var markdownStart = content.IndexOf("---", 3); // Find second ---
+            
+            if (markdownStart >= 0)
+            {
+                var markdownContent = content.Substring(markdownStart + 3).Trim();
+                return markdownContent;
+            }
+            
+            return "";
+        }
+        catch
+        {
+            return "";
         }
     }
 
@@ -430,6 +684,7 @@ Current configuration values are included as variables for reference.
             var lines = yamlContent.Split('\n', StringSplitOptions.RemoveEmptyEntries);
             string currentSection = "";
             string currentToolName = "";
+            MultiMcpServerConfig? currentServer = null;
             
             foreach (var line in lines)
             {
@@ -442,6 +697,32 @@ Current configuration values are included as variables for reference.
 
                 var key = trimmed.Substring(0, colonIndex).Trim();
                 var value = trimmed.Substring(colonIndex + 1).Trim().Trim('"');
+
+                // Handle array indicators for servers
+                if (trimmed.StartsWith("- "))
+                {
+                    if (currentSection == "servers" || currentSection == "server_tool_defaults")
+                    {
+                        // Start of a new server entry
+                        currentServer = new MultiMcpServerConfig();
+                        config.Servers.Add(currentServer);
+                        currentToolName = ""; // Reset tool name for new server
+                        currentSection = "servers"; // Reset to servers section
+                        
+                        // Parse the first property if it's on the same line
+                        var serverLine = trimmed.Substring(2).Trim(); // Remove "- "
+                        var serverColonIndex = serverLine.IndexOf(':');
+                        if (serverColonIndex > 0)
+                        {
+                            var serverKey = serverLine.Substring(0, serverColonIndex).Trim();
+                            var serverValue = serverLine.Substring(serverColonIndex + 1).Trim().Trim('"');
+                            SetServerProperty(currentServer, serverKey, serverValue);
+                        }
+                        continue;
+                    }
+                    // Handle other array sections if needed
+                    continue;
+                }
 
                 // Check if this is a section header (no value after colon, or empty value)
                 if (string.IsNullOrEmpty(value))
@@ -456,11 +737,39 @@ Current configuration values are included as variables for reference.
                         }
                         continue;
                     }
+                    else if (currentSection == "servers" && currentServer != null)
+                    {
+                        // Within a server definition, this might be a nested section like tool_defaults
+                        if (key.ToLower() == "tool_defaults")
+                        {
+                            currentToolName = ""; // Reset for server-specific tool defaults
+                            // Set a special flag to indicate we're in server tool_defaults section
+                            currentSection = "server_tool_defaults";
+                        }
+                        continue;
+                    }
+                    else if (currentSection == "server_tool_defaults")
+                    {
+                        // Within server's tool_defaults, this is a tool name
+                        currentToolName = key;
+                        if (currentServer != null && !currentServer.ToolDefaults.ContainsKey(currentToolName))
+                        {
+                            currentServer.ToolDefaults[currentToolName] = new Dictionary<string, object>();
+                        }
+                        continue;
+                    }
                     else
                     {
                         // This is a top-level section header
                         currentSection = key.ToLower();
                         currentToolName = ""; // Reset tool name when entering new section
+                        currentServer = null; // Reset server when entering new section
+                        
+                        // Special handling for servers section
+                        if (currentSection == "servers")
+                        {
+                            currentToolName = ""; // Ensure tool name is clear for servers
+                        }
                         continue;
                     }
                 }
@@ -474,9 +783,7 @@ Current configuration values are included as variables for reference.
                     case "description":
                         config.Description = value;
                         break;
-                    case "repository_url":
-                        config.RepositoryUrl = value;
-                        break;
+
                     case "ai_planning_prompt_file":
                         config.AiPlanningPromptFile = value;
                         break;
@@ -507,24 +814,7 @@ Current configuration values are included as variables for reference.
                             break;
                     }
                 }
-                else if (currentSection == "mcp_server")
-                {
-                    switch (key.ToLower())
-                    {
-                        case "port":
-                            config.McpServer.Port = int.Parse(value);
-                            break;
-                        case "auto_start":
-                            config.McpServer.AutoStart = bool.Parse(value);
-                            break;
-                        case "start_command":
-                            config.McpServer.StartCommand = value;
-                            break;
-                        case "working_directory":
-                            config.McpServer.WorkingDirectory = value;
-                            break;
-                    }
-                }
+
                 else if (currentSection == "variables")
                 {
                     config.Variables[key] = value;
@@ -536,6 +826,19 @@ Current configuration values are included as variables for reference.
                     {
                         config.ToolDefaults[currentToolName][key] = value;
                     }
+                }
+                else if (currentSection == "server_tool_defaults" && currentServer != null)
+                {
+                    // Handle parameters for the current tool within server's tool_defaults
+                    if (!string.IsNullOrEmpty(currentToolName))
+                    {
+                        currentServer.ToolDefaults[currentToolName][key] = value;
+                    }
+                }
+                else if (currentSection == "servers" && currentServer != null)
+                {
+                    // Handle direct server properties
+                    SetServerProperty(currentServer, key, value);
                 }
 
                 // Also handle dot notation for backward compatibility
@@ -562,25 +865,7 @@ Current configuration values are included as variables for reference.
                     }
                 }
 
-                if (key.StartsWith("mcp_server."))
-                {
-                    var mcpKey = key.Substring("mcp_server.".Length);
-                    switch (mcpKey.ToLower())
-                    {
-                        case "port":
-                            config.McpServer.Port = int.Parse(value);
-                            break;
-                        case "auto_start":
-                            config.McpServer.AutoStart = bool.Parse(value);
-                            break;
-                        case "start_command":
-                            config.McpServer.StartCommand = value;
-                            break;
-                        case "working_directory":
-                            config.McpServer.WorkingDirectory = value;
-                            break;
-                    }
-                }
+
             }
         }
         catch (Exception ex)
@@ -621,6 +906,65 @@ Current configuration values are included as variables for reference.
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Error parsing markdown sections");
+        }
+    }
+
+    private static void SetServerProperty(MultiMcpServerConfig server, string key, string value)
+    {
+        switch (key.ToLower())
+        {
+            case "name":
+                server.Name = value;
+                break;
+            case "type":
+                server.Type = value;
+                break;
+            case "url":
+                server.Url = value;
+                break;
+            case "description":
+                server.Description = value;
+                break;
+            case "enabled":
+                server.Enabled = bool.Parse(value);
+                break;
+            case "auto_start":
+                server.AutoStart = bool.Parse(value);
+                break;
+            case "port":
+                server.Port = int.Parse(value);
+                break;
+            case "start_command":
+                server.StartCommand = value;
+                break;
+            case "start_arguments":
+                server.StartArguments = value;
+                break;
+            case "branch":
+                server.Branch = value;
+                break;
+            case "local_path":
+                server.LocalPath = value;
+                break;
+            case "auth_type":
+                server.AuthType = value;
+                break;
+            case "auth_token":
+                server.AuthToken = value;
+                break;
+            // Handle array properties like tags
+            case "tags":
+                if (value.StartsWith("[") && value.EndsWith("]"))
+                {
+                    // Simple array parsing - remove brackets and split by comma
+                    var arrayValue = value.Substring(1, value.Length - 2);
+                    server.Tags = arrayValue.Split(',').Select(t => t.Trim().Trim('"')).ToList();
+                }
+                else
+                {
+                    server.Tags.Add(value);
+                }
+                break;
         }
     }
 } 

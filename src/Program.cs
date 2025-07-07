@@ -28,6 +28,7 @@ class Program
         var stopCommand = serviceProvider.GetRequiredService<StopCommand>();
         var runCommand = serviceProvider.GetRequiredService<RunCommand>();
         var templateCommand = serviceProvider.GetRequiredService<TemplateCommand>();
+        var serverCommand = serviceProvider.GetRequiredService<ServerCommand>();
 
         rootCommand.AddCommand(connectCommand.CreateCommand());
         rootCommand.AddCommand(configCommand.CreateCommand());
@@ -35,6 +36,7 @@ class Program
         rootCommand.AddCommand(stopCommand.CreateCommand());
         rootCommand.AddCommand(runCommand.CreateCommand());
         rootCommand.AddCommand(templateCommand.CreateCommand());
+        rootCommand.AddCommand(serverCommand.CreateCommand());
 
         // Execute the command
         try
@@ -72,6 +74,7 @@ class Program
         services.AddScoped<ISystemPromptService, SystemPromptService>();
         services.AddScoped<IEnvironmentVariableService, EnvironmentVariableService>();
         services.AddScoped<IAiPlanningService, AiPlanningService>();
+        services.AddScoped<IMultiMcpServerService, MultiMcpServerService>();
 
         // Commands
         services.AddScoped<ConnectCommand>();
@@ -80,5 +83,6 @@ class Program
         services.AddScoped<StopCommand>();
         services.AddScoped<RunCommand>();
         services.AddScoped<TemplateCommand>();
+        services.AddScoped<ServerCommand>();
     }
 }
