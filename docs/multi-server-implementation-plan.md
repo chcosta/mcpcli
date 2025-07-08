@@ -2,7 +2,7 @@
 
 ## 🎯 **Overview**
 
-This document outlines the implementation plan for adding support for multiple MCP servers to the MCP CLI tool. The feature will support both **git-based servers** (local repositories) and **HTTP-based servers** (remote endpoints). **Note: This is a breaking change that requires users to migrate from the legacy single-server format to the new multi-server format.**
+This document outlines the implementation plan for adding support for multiple MCP servers to the MCP CLI tool. The feature supports both **git-based servers** (local repositories) and **HTTP-based servers** (remote endpoints). Users can configure a single server or multiple servers using the unified multi-server configuration format.
 
 ## 🏗️ **Architecture Design**
 
@@ -40,7 +40,7 @@ servers:
 
 1. **Configuration Models**
    - `MultiMcpServerConfig` - Individual server configuration with enable/disable support
-   - `MarkdownConfig` - Simplified with servers list only (no legacy support)
+   - `MarkdownConfig` - Contains servers list
    - `RunningServerInfo` - Runtime server state
    - `ServerToolMapping` - Tool-to-server routing
    - `ServerStatus` - Server status information including enabled/disabled state
@@ -153,19 +153,61 @@ servers:
 - **Management Commands**: Control individual servers
 - **Performance Monitoring**: Track server response times and health
 
-## 🔄 **Migration Strategy**
+## 🔄 **Configuration Strategy**
 
-### **Breaking Changes**
+### **Unified Multi-Server Format**
 
-This implementation introduces breaking changes that require users to migrate their configuration:
+The MCP CLI tool now uses a unified multi-server configuration format that supports both single and multiple server configurations:
 
-1. **Legacy Format Removal**: The old `repository_url` and `mcp_server` configuration is no longer supported
-2. **New Format Required**: All configurations must use the new `servers` array format
-3. **Configuration Validation**: Existing configurations will fail validation until migrated
+1. **Single Server Configuration**: Configure just one server in the `servers` array
+2. **Multiple Server Configuration**: Configure multiple servers in the `servers` array
+3. **Flexible Enabling**: Enable/disable servers as needed without changing configuration
 
-### **Migration Path**
+### **Single Server Example**
 
-Users must migrate their configurations to the new format:
+```yaml
+servers:
+  - name: "primary"
+    type: "git"
+    url: "https://github.com/org/repo"
+    enabled: true
+    auto_start: true
+    port: 3000
+    environment:
+      NODE_ENV: "production"
+```
+
+### **Multiple Server Example**
+
+```yaml
+servers:
+  - name: "azure-devops"
+    type: "git"
+    url: "https://dev.azure.com/org/project/_git/repo"
+    enabled: true
+    auto_start: true
+    port: 3000
+    tool_defaults:
+      initialize_client: { organizationUrl: "dnceng" }
+      
+  - name: "weather-api"
+    type: "http"
+    url: "https://weather-api.example.com"
+    enabled: true
+    headers:
+      Authorization: "Bearer ${API_TOKEN}"
+```
+
+### **Configuration Benefits**
+
+1. **Simplified Architecture**: One configuration format for all scenarios
+2. **Flexible Scaling**: Start with one server, add more as needed
+3. **Dynamic Control**: Enable/disable servers without configuration changes
+4. **Consistent Behavior**: Same tool execution model regardless of server count
+
+### **Migration from Legacy Format**
+
+If you have existing configurations using the legacy format, migrate to the new format:
 
 **Before (Legacy Format):**
 ```yaml
@@ -211,7 +253,7 @@ Recommended migration tools to be developed:
 
 ### **Unit Tests**
 
-- [ ] Configuration parsing tests for new format
+- [ ] Configuration parsing tests for multi-server format
 - [ ] Server lifecycle management tests
 - [ ] Tool discovery and routing tests
 - [ ] Error handling and fallback tests
@@ -222,14 +264,15 @@ Recommended migration tools to be developed:
 
 - [ ] Multi-server startup and shutdown
 - [ ] Tool execution across different server types
-- [ ] AI planning with multiple servers
+- [ ] AI planning with single and multiple servers
 - [ ] Configuration validation end-to-end
 - [ ] Performance under load
 
 ### **Manual Testing Scenarios**
 
 1. **Configuration Formats**
-   - New multi-server configuration
+   - Single server configuration
+   - Multiple server configuration  
    - Server enable/disable scenarios
    - Invalid configurations (should fail gracefully)
    - Migration from legacy configurations
@@ -241,7 +284,8 @@ Recommended migration tools to be developed:
    - Server startup failures and recovery
 
 3. **Tool Execution**
-   - Simple tool calls with single server
+   - Tool calls with single server
+   - Tool calls with multiple servers
    - Complex AI planning with multiple servers
    - Tool conflicts and resolution
    - Server unavailability handling
@@ -256,8 +300,8 @@ Recommended migration tools to be developed:
 
 ### **User Documentation**
 
-- [ ] Update README with multi-server examples
-- [ ] Create migration guide for existing users (breaking changes)
+- [ ] Update README with unified multi-server examples
+- [ ] Create migration guide for existing users (legacy format)
 - [ ] Document server enable/disable functionality
 - [ ] Document configuration options and validation
 - [ ] Add troubleshooting guide for common issues
@@ -271,6 +315,7 @@ Recommended migration tools to be developed:
 
 ### **Example Configurations**
 
+- [ ] Single server setup for simple use cases
 - [ ] Enterprise setup with multiple internal servers
 - [ ] Development setup with local and remote servers
 - [ ] CI/CD pipeline integration examples
@@ -329,6 +374,7 @@ Recommended migration tools to be developed:
 - ✅ Server enable/disable functionality
 - ✅ Seamless tool routing across multiple servers
 - ✅ Graceful error handling and fallback behavior
+- ✅ Unified configuration format for single and multiple servers
 - ✅ Clean migration path from legacy configurations
 
 ### **Performance Metrics**
@@ -340,7 +386,7 @@ Recommended migration tools to be developed:
 
 ### **User Experience Metrics**
 
-- Clear migration path from legacy to new format
+- Unified configuration format for all use cases
 - Easy server enable/disable functionality
 - Clear error messages and troubleshooting
 - Intuitive configuration format
@@ -360,13 +406,13 @@ Recommended migration tools to be developed:
 
 ## 🎉 **Next Steps**
 
-1. **Review and Approval**: Get stakeholder approval for the implementation plan and breaking changes
-2. **Migration Communication**: Notify users about the breaking changes and migration requirements
-3. **Phase 2 Kickoff**: Begin implementing the `MultiMcpServerService` with enable/disable functionality
-4. **Testing Setup**: Establish testing environments for both server types
-5. **Documentation**: Start writing user-facing documentation including migration guides
+1. **Review and Approval**: Get stakeholder approval for the unified multi-server implementation
+2. **Migration Communication**: Notify users about the configuration format updates
+3. **Phase 2 Kickoff**: Continue implementing advanced multi-server features
+4. **Testing Setup**: Establish testing environments for both single and multi-server scenarios
+5. **Documentation**: Complete user-facing documentation including migration guides
 6. **Migration Tools**: Develop tools to help users migrate from legacy configurations
 
 ---
 
-*This implementation plan provides a comprehensive roadmap for adding multi-server support to the MCP CLI tool with server enable/disable functionality. **Note: This includes breaking changes that require users to migrate their existing configurations.*** 
+*This implementation plan provides a comprehensive roadmap for the unified multi-server architecture in the MCP CLI tool, supporting both single and multiple server configurations through a consistent interface.* 

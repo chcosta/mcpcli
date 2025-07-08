@@ -259,16 +259,8 @@ public class RunCommand
             // Determine if preview features should be used
             bool usePreviewFeatures = previewFeaturesFlag || markdownConfig.PreviewFeatures;
 
-            if (enabledServers.Count == 1)
-            {
-                // Single server mode - use existing logic for backward compatibility
-                await ExecuteSingleServerWorkflowAsync(enabledServers[0], prompt, workingDir, usePreviewFeatures, markdownConfig, executionSummary);
-            }
-            else
-            {
-                // Multi-server mode - use new multi-server functionality
-                await ExecuteMultiServerWorkflowAsync(enabledServers, prompt, workingDir, usePreviewFeatures, markdownConfig, executionSummary);
-            }
+            // Always use multi-server mode - supports single server configurations as well
+            await ExecuteMultiServerWorkflowAsync(enabledServers, prompt, workingDir, usePreviewFeatures, markdownConfig, executionSummary);
         }
         catch (Exception ex)
         {
@@ -277,123 +269,9 @@ public class RunCommand
         }
     }
 
-    private async Task ExecuteSingleServerWorkflowAsync(MultiMcpServerConfig enabledServer, string prompt, string workingDir, bool usePreviewFeatures, MarkdownConfig markdownConfig, ExecutionSummary executionSummary)
-    {
-        // Ensure we have a git server for single-server mode
-        if (enabledServer.Type != "git")
-        {
-            Console.WriteLine($"❌ Single server mode currently supports only git servers. Server '{enabledServer.Name}' is type '{enabledServer.Type}'.");
-            Console.WriteLine("💡 For HTTP servers, enable multiple servers to use multi-server mode.");
-            return;
-        }
-
-        Console.WriteLine($"🖥️ Using server: {enabledServer.Name} ({enabledServer.Type})");
-
-        // Get repository name and local path
-        var repoName = _gitService.GetRepositoryNameFromUrl(enabledServer.Url);
-        var localPath = Path.Combine(workingDir, "servers", repoName);
-
-        // Track repository and MCP server usage
-        executionSummary.AddRepositoryCloned(enabledServer.Url);
-        executionSummary.AddMcpServerUsed(enabledServer.Name);
-
-        // Clone or update repository
-        if (!await _gitService.IsRepositoryClonedAsync(localPath))
-        {
-            Console.WriteLine($"Cloning repository: {enabledServer.Url}");
-            var progress = new Progress<string>(message => Console.WriteLine($"  {message}"));
-            await _gitService.CloneRepositoryAsync(enabledServer.Url, localPath, progress);
-            Console.WriteLine("Repository cloned successfully.");
-        }
-        else
-        {
-            Console.WriteLine($"Repository already exists at: {localPath}");
-            Console.WriteLine("Updating repository...");
-            await _gitService.UpdateRepositoryAsync(localPath);
-            Console.WriteLine("Repository updated successfully.");
-        }
-
-        // Discover and start MCP server
-        Console.WriteLine("Discovering MCP server configuration...");
-        var serverInfo = await _mcpServerService.DiscoverServerConfigurationAsync(localPath);
-        
-        // Apply configuration overrides
-        if (!string.IsNullOrEmpty(enabledServer.StartCommand))
-        {
-            serverInfo.StartCommand = enabledServer.StartCommand;
-            if (!string.IsNullOrEmpty(enabledServer.StartArguments))
-            {
-                serverInfo.StartArguments = enabledServer.StartArguments.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            }
-        }
-        
-        serverInfo.Port = enabledServer.Port;
-        serverInfo.Environment = enabledServer.Environment;
-
-        if (enabledServer.AutoStart)
-        {
-            Console.WriteLine($"Starting MCP server on port {serverInfo.Port}...");
-            var runningServer = await _mcpServerService.StartServerAsync(localPath, serverInfo.Port);
-            
-            if (!runningServer.IsRunning)
-            {
-                Console.WriteLine("Failed to start MCP server.");
-                return;
-            }
-
-            Console.WriteLine("MCP server started successfully.");
-
-            try
-            {
-                Console.WriteLine($"Sending prompt: {prompt}");
-                
-                string finalResponse;
-                if (usePreviewFeatures)
-                {
-                    Console.WriteLine("Using preview features (AI planning mode)");
-                    executionSummary.ExecutionMode = "AI Planning Mode (Single Server)";
-                    
-                    if (_aiPlanningService != null)
-                    {
-                        Console.WriteLine("Using AI Planning Service");
-                        finalResponse = await _aiPlanningService.ProcessPromptWithAIAsync(runningServer, prompt, markdownConfig, executionSummary);
-                    }
-                    else
-                    {
-                        Console.WriteLine("AI Planning Service not available, falling back to built-in AI planning");
-                        finalResponse = await ProcessPromptWithAIAsync(runningServer, prompt, markdownConfig, executionSummary);
-                    }
-                }
-                else
-                {
-                    Console.WriteLine("Using simple mode (direct tool execution)");
-                    executionSummary.ExecutionMode = "Simple Mode (Direct Tool Execution)";
-                    finalResponse = await ProcessPromptDirectlyAsync(runningServer, prompt, markdownConfig, executionSummary, enabledServer.ToolDefaults);
-                }
-                
-                // Complete execution tracking
-                executionSummary.CompleteExecution();
-                
-                FormatAndDisplayFinalResponse(finalResponse, executionSummary);
-            }
-            finally
-            {
-                // Clean up - stop the server
-                Console.WriteLine("Stopping MCP server...");
-                await _mcpServerService.StopServerAsync(runningServer);
-                Console.WriteLine("MCP server stopped.");
-            }
-        }
-        else
-        {
-            Console.WriteLine("MCP server auto-start is disabled in configuration.");
-            Console.WriteLine("You can manually start the server using the 'connect' command.");
-        }
-    }
-
     private async Task ExecuteMultiServerWorkflowAsync(List<MultiMcpServerConfig> enabledServers, string prompt, string workingDir, bool usePreviewFeatures, MarkdownConfig markdownConfig, ExecutionSummary executionSummary)
     {
-        Console.WriteLine($"🚀 Multi-Server Mode: Starting {enabledServers.Count} servers");
+        Console.WriteLine($"🚀 Multi-Server Mode: Starting {enabledServers.Count} server{(enabledServers.Count == 1 ? "" : "s")}");
         
         // Start all enabled servers
         var runningServers = await _multiMcpServerService.StartServersAsync(markdownConfig, workingDir, executionSummary);
@@ -405,7 +283,7 @@ public class RunCommand
             return;
         }
 
-        Console.WriteLine($"✅ Successfully started {successfulServers.Count} out of {enabledServers.Count} servers");
+        Console.WriteLine($"✅ Successfully started {successfulServers.Count} out of {enabledServers.Count} server{(enabledServers.Count == 1 ? "" : "s")}");
         foreach (var server in successfulServers)
         {
             Console.WriteLine($"   • {server.Name} ({server.Type}) on port {server.Port}");
@@ -417,7 +295,7 @@ public class RunCommand
             Console.WriteLine("\n🔍 Discovering tools across all servers...");
             var serverToolMapping = await _multiMcpServerService.GetAvailableToolsAsync(successfulServers);
             
-            Console.WriteLine($"📊 Found {serverToolMapping.AllTools.Count} tools across {successfulServers.Count} servers");
+            Console.WriteLine($"📊 Found {serverToolMapping.AllTools.Count} tools across {successfulServers.Count} server{(successfulServers.Count == 1 ? "" : "s")}");
             
             if (serverToolMapping.ConflictingTools.Count > 0)
             {
@@ -429,7 +307,7 @@ public class RunCommand
             string finalResponse;
             if (usePreviewFeatures)
             {
-                Console.WriteLine("Using preview features (Multi-Server AI Planning Mode)");
+                Console.WriteLine($"Using preview features (Multi-Server AI Planning Mode)");
                 executionSummary.ExecutionMode = "Multi-Server AI Planning Mode";
                 
                 if (_aiPlanningService != null)
@@ -445,7 +323,7 @@ public class RunCommand
             }
             else
             {
-                Console.WriteLine("Using simple multi-server mode (direct tool execution)");
+                Console.WriteLine($"Using simple multi-server mode (direct tool execution)");
                 executionSummary.ExecutionMode = "Multi-Server Simple Mode";
                 finalResponse = await ProcessMultiServerPromptDirectlyAsync(successfulServers, serverToolMapping, prompt, markdownConfig, executionSummary);
             }

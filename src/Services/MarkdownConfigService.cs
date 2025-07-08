@@ -550,6 +550,62 @@ Current configuration values are included as variables for reference.
                     yaml.AppendLine($"    auth_type: {EscapeYamlValue(server.AuthType)}");
                 }
                 
+                // Azure Identity configuration
+                if (server.UseAzureIdentity)
+                {
+                    yaml.AppendLine($"    use_azure_identity: {server.UseAzureIdentity.ToString().ToLower()}");
+                    
+                    if (!string.IsNullOrEmpty(server.AzureTenantId))
+                    {
+                        yaml.AppendLine($"    azure_tenant_id: {EscapeYamlValue(server.AzureTenantId)}");
+                    }
+                    
+                    yaml.AppendLine($"    allow_interactive_auth: {server.AllowInteractiveAuth.ToString().ToLower()}");
+                    
+                    if (server.AzureScopes.Count > 0)
+                    {
+                        yaml.AppendLine($"    azure_scopes: [{string.Join(", ", server.AzureScopes.Select(EscapeYamlValue))}]");
+                    }
+                }
+                
+                // GitHub authentication configuration
+                if (server.UseGitHubAuth)
+                {
+                    yaml.AppendLine($"    use_github_auth: {server.UseGitHubAuth.ToString().ToLower()}");
+                    
+                    if (!string.IsNullOrEmpty(server.GitHubAuthMethod))
+                    {
+                        yaml.AppendLine($"    github_auth_method: {EscapeYamlValue(server.GitHubAuthMethod)}");
+                    }
+                    
+                    // Token method configuration
+                    if (server.GitHubAuthMethod == "token" && !string.IsNullOrEmpty(server.GitHubToken))
+                    {
+                        yaml.AppendLine($"    github_token: {PreserveEnvironmentVariableFormat("github_token", server.GitHubToken)}");
+                    }
+                    
+                    // OAuth method configuration
+                    if (server.GitHubAuthMethod == "oauth")
+                    {
+                        if (!string.IsNullOrEmpty(server.GitHubClientId))
+                        {
+                            yaml.AppendLine($"    github_client_id: {PreserveEnvironmentVariableFormat("github_client_id", server.GitHubClientId)}");
+                        }
+                        
+                        if (!string.IsNullOrEmpty(server.GitHubClientSecret))
+                        {
+                            yaml.AppendLine($"    github_client_secret: {PreserveEnvironmentVariableFormat("github_client_secret", server.GitHubClientSecret)}");
+                        }
+                        
+                        yaml.AppendLine($"    allow_github_interactive_auth: {server.AllowGitHubInteractiveAuth.ToString().ToLower()}");
+                    }
+                    
+                    if (server.GitHubScopes.Count > 0)
+                    {
+                        yaml.AppendLine($"    github_scopes: [{string.Join(", ", server.GitHubScopes.Select(EscapeYamlValue))}]");
+                    }
+                }
+                
                 if (server.ToolDefaults.Count > 0)
                 {
                     yaml.AppendLine("    tool_defaults:");
@@ -598,6 +654,39 @@ Current configuration values are included as variables for reference.
         }
         
         return yaml.ToString();
+    }
+
+    private string StripYamlComment(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return value;
+
+        // Find comment character '#' that's not inside quotes
+        bool insideQuotes = false;
+        char quoteChar = '\0';
+        
+        for (int i = 0; i < value.Length; i++)
+        {
+            var ch = value[i];
+            
+            if (!insideQuotes && (ch == '"' || ch == '\''))
+            {
+                insideQuotes = true;
+                quoteChar = ch;
+            }
+            else if (insideQuotes && ch == quoteChar)
+            {
+                insideQuotes = false;
+                quoteChar = '\0';
+            }
+            else if (!insideQuotes && ch == '#')
+            {
+                // Found a comment, return everything before it
+                return value.Substring(0, i).Trim();
+            }
+        }
+        
+        return value;
     }
 
     private string EscapeYamlValue(string value)
@@ -696,12 +785,15 @@ Current configuration values are included as variables for reference.
                 if (colonIndex == -1) continue;
 
                 var key = trimmed.Substring(0, colonIndex).Trim();
-                var value = trimmed.Substring(colonIndex + 1).Trim().Trim('"');
+                var valueWithComment = trimmed.Substring(colonIndex + 1).Trim();
+                
+                // Strip comments (anything after #, but not inside quotes)
+                var value = StripYamlComment(valueWithComment).Trim('"');
 
                 // Handle array indicators for servers
                 if (trimmed.StartsWith("- "))
                 {
-                    if (currentSection == "servers" || currentSection == "server_tool_defaults")
+                    if (currentSection == "servers" || currentSection == "server_tool_defaults" || currentSection == "server_headers")
                     {
                         // Start of a new server entry
                         currentServer = new MultiMcpServerConfig();
@@ -715,7 +807,8 @@ Current configuration values are included as variables for reference.
                         if (serverColonIndex > 0)
                         {
                             var serverKey = serverLine.Substring(0, serverColonIndex).Trim();
-                            var serverValue = serverLine.Substring(serverColonIndex + 1).Trim().Trim('"');
+                            var serverValueWithComment = serverLine.Substring(serverColonIndex + 1).Trim();
+                            var serverValue = StripYamlComment(serverValueWithComment).Trim('"');
                             SetServerProperty(currentServer, serverKey, serverValue);
                         }
                         continue;
@@ -739,12 +832,17 @@ Current configuration values are included as variables for reference.
                     }
                     else if (currentSection == "servers" && currentServer != null)
                     {
-                        // Within a server definition, this might be a nested section like tool_defaults
+                        // Within a server definition, this might be a nested section like tool_defaults or headers
                         if (key.ToLower() == "tool_defaults")
                         {
                             currentToolName = ""; // Reset for server-specific tool defaults
                             // Set a special flag to indicate we're in server tool_defaults section
                             currentSection = "server_tool_defaults";
+                        }
+                        else if (key.ToLower() == "headers")
+                        {
+                            // Set a special flag to indicate we're in server headers section
+                            currentSection = "server_headers";
                         }
                         continue;
                     }
@@ -834,6 +932,11 @@ Current configuration values are included as variables for reference.
                     {
                         currentServer.ToolDefaults[currentToolName][key] = value;
                     }
+                }
+                else if (currentSection == "server_headers" && currentServer != null)
+                {
+                    // Handle header key-value pairs
+                    currentServer.Headers[key] = value;
                 }
                 else if (currentSection == "servers" && currentServer != null)
                 {
@@ -952,7 +1055,34 @@ Current configuration values are included as variables for reference.
             case "auth_token":
                 server.AuthToken = value;
                 break;
-            // Handle array properties like tags
+            case "use_azure_identity":
+                server.UseAzureIdentity = bool.Parse(value);
+                break;
+            case "azure_tenant_id":
+                server.AzureTenantId = value;
+                break;
+            case "allow_interactive_auth":
+                server.AllowInteractiveAuth = bool.Parse(value);
+                break;
+            case "use_github_auth":
+                server.UseGitHubAuth = bool.Parse(value);
+                break;
+            case "github_auth_method":
+                server.GitHubAuthMethod = value;
+                break;
+            case "github_token":
+                server.GitHubToken = value;
+                break;
+            case "github_client_id":
+                server.GitHubClientId = value;
+                break;
+            case "github_client_secret":
+                server.GitHubClientSecret = value;
+                break;
+            case "allow_github_interactive_auth":
+                server.AllowGitHubInteractiveAuth = bool.Parse(value);
+                break;
+            // Handle array properties like tags and azure_scopes
             case "tags":
                 if (value.StartsWith("[") && value.EndsWith("]"))
                 {
@@ -963,6 +1093,30 @@ Current configuration values are included as variables for reference.
                 else
                 {
                     server.Tags.Add(value);
+                }
+                break;
+            case "azure_scopes":
+                if (value.StartsWith("[") && value.EndsWith("]"))
+                {
+                    // Simple array parsing - remove brackets and split by comma
+                    var arrayValue = value.Substring(1, value.Length - 2);
+                    server.AzureScopes = arrayValue.Split(',').Select(s => s.Trim().Trim('"')).ToList();
+                }
+                else
+                {
+                    server.AzureScopes.Add(value);
+                }
+                break;
+            case "github_scopes":
+                if (value.StartsWith("[") && value.EndsWith("]"))
+                {
+                    // Simple array parsing - remove brackets and split by comma
+                    var arrayValue = value.Substring(1, value.Length - 2);
+                    server.GitHubScopes = arrayValue.Split(',').Select(s => s.Trim().Trim('"')).ToList();
+                }
+                else
+                {
+                    server.GitHubScopes.Add(value);
                 }
                 break;
         }

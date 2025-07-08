@@ -170,33 +170,113 @@ Stop running MCP servers (placeholder for future implementation).
 
 ## Markdown Configuration Format
 
-Markdown configuration files use YAML frontmatter for structured configuration and Markdown content for documentation and default prompts.
+Markdown configuration files use YAML frontmatter for structured configuration and Markdown content for documentation and default prompts. The configuration supports **multiple MCP servers** for enhanced functionality.
 
-### Example Configuration
+### Configuration Examples
+
+The MCP CLI supports a unified multi-server configuration format that works for both single and multiple server setups:
+
+#### Single Server Configuration
 
 ```markdown
 ---
-name: "My MCP Server"
-description: "File system operations server"
+name: "Azure DevOps Integration"
+description: "Azure DevOps MCP server for project management"
+preview_features: false
 azure_ai:
   endpoint: "https://your-resource.openai.azure.com/"
-  api_key: "your-api-key"
-  deployment_name: "gpt-4"
-  model_name: "gpt-4"
+  api_key: "${AZURE_AI_API_KEY}"
+  deployment_name: "gpt-4o"
+  model_name: "gpt-4o"
   use_managed_identity: false
-repository_url: "https://dev.azure.com/org/project/_git/mcp-server"
-mcp_server:
-  port: 3000
-  auto_start: true
-  environment:
-    NODE_ENV: "production"
-variables:
-  base_path: "C:\\Data"
+
+# MCP Servers Configuration
+servers:
+  - name: "azure-devops-primary"
+    type: "git"
+    url: "https://dev.azure.com/dnceng/internal/_git/dnceng-ai-experimental"
+    description: "Azure DevOps integration server"
+    enabled: true
+    auto_start: true
+    port: 3000
+    tags: [azure-devops, primary]
+    use_managed_identity: true
+    tool_defaults:
+      initialize_azure_dev_ops_client:
+        organizationUrl: "dnceng"
+      get_repositories:
+        projectName: "internal"
 ---
 
-# My MCP Server
+# Azure DevOps Integration
 
-This server provides file system operations.
+This server provides Azure DevOps operations including project management, pull request tracking, and repository analysis.
+```
+
+#### Multiple Servers Configuration
+
+```markdown
+---
+name: "Multi-Server Setup"
+description: "Combined Azure DevOps and file system operations"
+preview_features: false
+azure_ai:
+  endpoint: "https://your-resource.openai.azure.com/"
+  api_key: "${AZURE_AI_API_KEY}"
+  deployment_name: "gpt-4o"
+  model_name: "gpt-4o"
+  use_managed_identity: false
+
+# MCP Servers Configuration
+servers:
+  - name: "azure-devops-primary"
+    type: "git"
+    url: "https://dev.azure.com/dnceng/internal/_git/dnceng-ai-experimental"
+    description: "Azure DevOps integration server"
+    enabled: true
+    auto_start: true
+    port: 3000
+    tags: [azure-devops, primary]
+    use_managed_identity: true
+    tool_defaults:
+      initialize_azure_dev_ops_client:
+        organizationUrl: "dnceng"
+        
+  - name: "filesystem-server"
+    type: "git"
+    url: "https://github.com/org/filesystem-mcp.git"
+    description: "File system operations server"
+    enabled: true
+    auto_start: true
+    port: 3001
+    tags: [filesystem, utility]
+    environment:
+      BASE_PATH: "${BASE_PATH:C:\\Data}"
+      NODE_ENV: "production"
+    tool_defaults:
+      read_file:
+        encoding: "utf-8"
+      list_directory:
+        include_hidden: false
+        
+  - name: "database-tools"
+    type: "http"
+    url: "https://api.example.com/mcp"
+    description: "Database operations via HTTP"
+    enabled: false
+    tags: [database, http]
+    headers:
+      Authorization: "Bearer ${DB_API_TOKEN}"
+      Content-Type: "application/json"
+---
+
+# Multi-Server MCP Setup
+
+This configuration provides access to multiple MCP servers:
+- **Azure DevOps**: Project management and repository operations
+- **File System**: Local file operations and analysis
+- **Database Tools**: Remote database operations (disabled by default)
+```
 
 ## Default Prompts
 
@@ -216,18 +296,29 @@ Analyze the project structure and identify main components
 **YAML Frontmatter:**
 - `name`: Configuration name
 - `description`: Configuration description
+- `preview_features`: Enable preview features (default: false)
 - `azure_ai`: Azure AI Foundry settings
   - `endpoint`: Azure OpenAI endpoint URL
   - `api_key`: API key (or use managed identity)
   - `deployment_name`: Model deployment name
-  - `model_name`: Model name (e.g., gpt-4)
+  - `model_name`: Model name (e.g., gpt-4o)
   - `use_managed_identity`: Use managed identity instead of API key
-- `repository_url`: Azure DevOps Git repository URL
-- `mcp_server`: MCP server configuration
-  - `port`: Server port (default: 3000)
-  - `auto_start`: Auto-start server (default: true)
-  - `environment`: Environment variables
-- `variables`: Custom variables for reuse
+- `servers`: Array of MCP server configurations
+  - `name`: Unique server name
+  - `type`: Server type (`git` or `http`)
+  - `url`: Repository URL (git) or API endpoint (http)
+  - `description`: Server description (optional)
+  - `enabled`: Enable/disable server (default: true)
+  - `auto_start`: Auto-start server (default: true, git only)
+  - `port`: Server port (git servers only, default: 3000)
+  - `tags`: Array of tags for organization (optional)
+  - `use_managed_identity`: Use Azure managed identity (optional)
+  - `environment`: Environment variables for git servers (optional)
+  - `headers`: HTTP headers for http servers (optional)
+  - `tool_defaults`: Default parameters for tools (optional)
+    - `tool_name`: Tool name
+      - `parameter_name`: Default parameter value
+- `variables`: Custom variables for reuse (optional)
 
 **Markdown Content:**
 - Code blocks (```) are parsed as default prompts
@@ -241,21 +332,40 @@ For security, use environment variables instead of hardcoding secrets in configu
 
 ```markdown
 ---
-name: "Secure MCP Server"
-description: "Configuration using environment variables"
+name: "Secure Multi-Server Setup"
+description: "Configuration using environment variables for security"
+preview_features: false
 azure_ai:
   endpoint: "${AZURE_AI_ENDPOINT}"
   api_key: "${AZURE_AI_API_KEY}"
   deployment_name: "${AZURE_AI_DEPLOYMENT_NAME}"
-  model_name: "${AZURE_AI_MODEL_NAME:gpt-4}"
+  model_name: "${AZURE_AI_MODEL_NAME:gpt-4o}"
   use_managed_identity: false
-repository_url: "https://dev.azure.com/${AZURE_DEVOPS_ORG}/${AZURE_DEVOPS_PROJECT}/_git/my-mcp-server"
-mcp_server:
-  port: "${MCP_SERVER_PORT:3000}"
-  auto_start: true
-  environment:
-    NODE_ENV: "production"
-    CUSTOM_VAR: "${CUSTOM_VARIABLE:default-value}"
+
+servers:
+  - name: "azure-devops"
+    type: "git"
+    url: "https://dev.azure.com/${AZURE_DEVOPS_ORG}/${AZURE_DEVOPS_PROJECT}/_git/my-mcp-server"
+    description: "Azure DevOps integration"
+    enabled: true
+    auto_start: true
+    port: "${MCP_SERVER_PORT:3000}"
+    use_managed_identity: true
+    tool_defaults:
+      initialize_azure_dev_ops_client:
+        organizationUrl: "${AZURE_DEVOPS_ORG}"
+        
+  - name: "custom-server"
+    type: "git"
+    url: "https://github.com/${GITHUB_ORG}/custom-mcp.git"
+    description: "Custom operations server"
+    enabled: "${ENABLE_CUSTOM_SERVER:true}"
+    auto_start: true
+    port: 3001
+    environment:
+      NODE_ENV: "production"
+      CUSTOM_VAR: "${CUSTOM_VARIABLE:default-value}"
+      API_ENDPOINT: "${EXTERNAL_API_ENDPOINT}"
 ---
 ```
 
@@ -296,6 +406,66 @@ $env:AZURE_DEVOPS_PROJECT="your-project"
 
 📖 **Full Documentation**: See [docs/environment-variables.md](docs/environment-variables.md) for complete details.
 
+## Key Features
+
+### Multi-Server Support
+
+Configure and manage multiple MCP servers simultaneously:
+- **Git Servers**: Clone from Azure DevOps or GitHub repositories
+- **HTTP Servers**: Connect to remote MCP APIs  
+- **Enable/Disable**: Control which servers are active
+- **Tool Routing**: Automatically route tool calls to appropriate servers
+- **Parallel Execution**: Execute tools across multiple servers
+
+### Tool Defaults
+
+Define default parameters for MCP tools to simplify usage:
+
+```yaml
+tool_defaults:
+  initialize_azure_dev_ops_client:
+    organizationUrl: "dnceng"
+  get_repositories:
+    projectName: "internal"
+  read_file:
+    encoding: "utf-8"
+```
+
+With tool defaults configured:
+- **Before**: `mcpcli run -p "initialize azure devops client with organization dnceng"`
+- **After**: `mcpcli run -p "initialize azure devops client"` (organization auto-filled)
+
+### Server Management
+
+Control individual servers without changing configuration:
+
+```cmd
+# List all configured servers and their status
+mcpcli server list
+
+# Enable a specific server
+mcpcli server enable azure-devops-primary
+
+# Disable a server temporarily  
+mcpcli server disable database-tools
+
+# Check server health and performance
+mcpcli server status
+```
+
+### Preview Features
+
+Enable experimental features like AI planning mode:
+
+```yaml
+preview_features: true  # Enable in configuration
+```
+
+Or use command line flag:
+```cmd
+mcpcli run --config config.md --preview-features --prompt "complex task"
+```
+
 ## Supported MCP Server Types
 
 The CLI automatically detects and supports:
@@ -317,23 +487,42 @@ Choose one of:
 
 Choose one of the following authentication methods:
 
-**Method 1: Personal Access Token (PAT)**
-```cmd
-mcpcli config set --key "AzureDevOps.Organization" --value "your-org"
-mcpcli config set --key "AzureDevOps.PersonalAccessToken" --value "your-pat"
+**Method 1: DefaultAzureCredential (Recommended)**
+Set `use_managed_identity: true` in your server configuration:
+
+```yaml
+servers:
+  - name: "azure-devops"
+    type: "git"
+    url: "https://dev.azure.com/org/project/_git/repo"
+    use_managed_identity: true
+    tool_defaults:
+      initialize_azure_dev_ops_client:
+        organizationUrl: "your-org"
 ```
 
-**Method 2: DefaultAzureCredential (Recommended for Enterprise)**
+DefaultAzureCredential supports multiple authentication methods (tried in order):
+- **Managed Identity**: Azure VMs, App Service, Container Instances, etc.
+- **Azure CLI**: `az login` (works on developer machines)
+- **Visual Studio**: Visual Studio IDE authentication
+- **Environment Variables**: `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_TENANT_ID`
+- **Interactive Browser**: Fallback browser-based authentication
+
+**Method 2: Personal Access Token (PAT)**
+Set the `AZURE_DEVOPS_PAT` environment variable:
+
 ```cmd
-mcpcli config set --key "AzureDevOps.Organization" --value "your-org"
-mcpcli config set --key "AzureDevOps.UseManagedIdentity" --value "true"
+# Windows PowerShell
+$env:AZURE_DEVOPS_PAT="your-pat-token-here"
+
+# Windows Command Prompt
+set AZURE_DEVOPS_PAT=your-pat-token-here
 ```
 
-DefaultAzureCredential supports:
-- Managed Identity (Azure VMs, App Service, etc.)
-- Azure CLI authentication (`az login`)
-- Visual Studio authentication
-- Environment variables (AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID)
+The PAT requires these scopes:
+- **Code (read)**: Access repositories
+- **Project and team (read)**: List projects
+- **Pull Request (read)**: Access pull requests
 
 ## Configuration Files
 
@@ -347,11 +536,28 @@ DefaultAzureCredential supports:
 ```markdown
 ---
 name: "File Operations"
-repository_url: "https://dev.azure.com/org/project/_git/filesystem-mcp"
-mcp_server:
-  port: 3000
-  environment:
-    BASE_PATH: "C:\\Data"
+description: "Local file system operations"
+azure_ai:
+  endpoint: "${AZURE_AI_ENDPOINT}"
+  api_key: "${AZURE_AI_API_KEY}"
+  deployment_name: "gpt-4o"
+  model_name: "gpt-4o"
+
+servers:
+  - name: "filesystem-server"
+    type: "git"
+    url: "https://dev.azure.com/org/project/_git/filesystem-mcp"
+    description: "File system operations server"
+    enabled: true
+    auto_start: true
+    port: 3000
+    environment:
+      BASE_PATH: "C:\\Data"
+    tool_defaults:
+      read_file:
+        encoding: "utf-8"
+      list_directory:
+        show_hidden: false
 ---
 
 # File Operations MCP Server
@@ -372,11 +578,27 @@ Search for files containing "configuration" and summarize their contents
 ```markdown
 ---
 name: "Database Tools"
-repository_url: "https://dev.azure.com/org/project/_git/database-mcp"
-mcp_server:
-  port: 3001
-  environment:
-    DB_CONNECTION: "Server=localhost;Database=mydb"
+description: "Database operations and analysis"
+azure_ai:
+  endpoint: "${AZURE_AI_ENDPOINT}"
+  api_key: "${AZURE_AI_API_KEY}"
+  deployment_name: "gpt-4o"
+  model_name: "gpt-4o"
+
+servers:
+  - name: "database-server"
+    type: "git"
+    url: "https://dev.azure.com/org/project/_git/database-mcp"
+    description: "Database operations server"
+    enabled: true
+    auto_start: true
+    port: 3001
+    environment:
+      DB_CONNECTION: "Server=localhost;Database=mydb"
+    tool_defaults:
+      execute_query:
+        timeout: 30
+        format: "table"
 ---
 
 # Database Tools MCP Server

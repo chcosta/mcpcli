@@ -4,6 +4,8 @@ using System.Net.Sockets;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using McpCli.Models;
+using Azure.Identity;
+using Azure.Core;
 
 namespace McpCli.Services;
 
@@ -13,6 +15,7 @@ public class MultiMcpServerService : IMultiMcpServerService
     private readonly HttpClient _httpClient;
     private readonly IGitService _gitService;
     private readonly IMcpServerService _mcpServerService;
+    private readonly IEnvironmentVariableService _environmentVariableService;
     private readonly Dictionary<string, Process> _runningProcesses = new();
     private readonly Dictionary<string, HttpClient> _httpClients = new();
     private readonly Dictionary<string, DateTime> _lastHealthCheck = new();
@@ -21,12 +24,14 @@ public class MultiMcpServerService : IMultiMcpServerService
         ILogger<MultiMcpServerService> logger,
         HttpClient httpClient,
         IGitService gitService,
-        IMcpServerService mcpServerService)
+        IMcpServerService mcpServerService,
+        IEnvironmentVariableService environmentVariableService)
     {
         _logger = logger;
         _httpClient = httpClient;
         _gitService = gitService;
         _mcpServerService = mcpServerService;
+        _environmentVariableService = environmentVariableService;
     }
 
     public async Task<List<RunningServerInfo>> StartServersAsync(MarkdownConfig config, string workingDir, ExecutionSummary? executionSummary = null)
@@ -308,7 +313,14 @@ public class MultiMcpServerService : IMultiMcpServerService
                     }
                     else if (server.Type == "http")
                     {
-                        status.IsRunning = await IsHttpServerRespondingAsync(server.Url);
+                        if (_httpClients.TryGetValue(server.Name, out var httpClient))
+                        {
+                            status.IsRunning = await IsHttpServerRespondingAsync(httpClient, server.Url);
+                        }
+                        else
+                        {
+                            status.IsRunning = false;
+                        }
                     }
                 }
                 catch (Exception ex)
@@ -409,6 +421,10 @@ public class MultiMcpServerService : IMultiMcpServerService
 
         var startedServer = await _mcpServerService.StartServerAsync(localPath, port);
         runningServer.ProcessId = startedServer.ProcessId;
+        
+        // IMPORTANT: Update the LocalPath to match what the McpServerService is using
+        // This ensures process lookup keys match between services
+        runningServer.LocalPath = startedServer.LocalPath;
 
         // Store the process for management
         var processKey = $"{serverConfig.Name}:{port}";
@@ -421,11 +437,22 @@ public class MultiMcpServerService : IMultiMcpServerService
 
     private async Task StartHttpServerAsync(MultiMcpServerConfig serverConfig, RunningServerInfo runningServer)
     {
-        // Create HTTP client with authentication
+        // Create HTTP client with authentication and timeout
         var httpClient = new HttpClient();
+        httpClient.Timeout = TimeSpan.FromSeconds(30); // Set 30-second timeout
         
-        // Configure authentication
-        if (!string.IsNullOrEmpty(serverConfig.AuthToken))
+        // Configure Azure Identity authentication if enabled
+        if (serverConfig.UseAzureIdentity)
+        {
+            await ConfigureAzureIdentityAuthAsync(httpClient, serverConfig);
+        }
+        // Configure GitHub authentication if enabled
+        else if (serverConfig.UseGitHubAuth)
+        {
+            await ConfigureGitHubAuthAsync(httpClient, serverConfig);
+        }
+        // Configure traditional authentication
+        else if (!string.IsNullOrEmpty(serverConfig.AuthToken))
         {
             switch (serverConfig.AuthType?.ToLower())
             {
@@ -444,10 +471,27 @@ public class MultiMcpServerService : IMultiMcpServerService
             }
         }
 
-        // Add custom headers
+        // Add custom headers - resolve environment variables first
         foreach (var header in serverConfig.Headers)
         {
-            httpClient.DefaultRequestHeaders.Add(header.Key, header.Value);
+            var resolvedValue = _environmentVariableService.ResolveEnvironmentVariables(header.Value);
+            _logger.LogDebug("Adding header {HeaderName} for server {ServerName}", header.Key, serverConfig.Name);
+            
+            // Content-Type is a content header and will be set per request, skip it here
+            if (header.Key.Equals("Content-Type", StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogDebug("Skipping Content-Type header - will be set per request");
+                continue;
+            }
+            
+            try
+            {
+                httpClient.DefaultRequestHeaders.Add(header.Key, resolvedValue);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to add header {HeaderName}: {HeaderValue}", header.Key, resolvedValue);
+            }
         }
 
         // Store the HTTP client
@@ -455,14 +499,448 @@ public class MultiMcpServerService : IMultiMcpServerService
         runningServer.Headers = serverConfig.Headers;
         runningServer.AuthToken = serverConfig.AuthToken;
 
-        // Test connection
-        var isResponding = await IsHttpServerRespondingAsync(serverConfig.Url);
+        // Test connection using the configured client with headers
+        _logger.LogInformation("Testing connection to HTTP server: {ServerUrl}", serverConfig.Url);
+        var isResponding = await IsHttpServerRespondingAsync(httpClient, serverConfig.Url);
         if (!isResponding)
         {
-            throw new InvalidOperationException($"HTTP server at {serverConfig.Url} is not responding");
+            _logger.LogWarning("Connection test failed for {ServerUrl}, but proceeding anyway (some MCP servers may not respond to initialization requests)", serverConfig.Url);
         }
 
         _logger.LogInformation("HTTP server connection established: {ServerUrl}", serverConfig.Url);
+    }
+
+    private async Task ConfigureAzureIdentityAuthAsync(HttpClient httpClient, MultiMcpServerConfig serverConfig)
+    {
+        try
+        {
+            _logger.LogInformation("Configuring Azure Identity authentication for server {ServerName}", serverConfig.Name);
+
+            // Create credential options
+            var options = new DefaultAzureCredentialOptions();
+            
+            // Configure tenant ID if specified
+            if (!string.IsNullOrEmpty(serverConfig.AzureTenantId))
+            {
+                options.TenantId = serverConfig.AzureTenantId;
+                _logger.LogDebug("Using Azure tenant ID: {TenantId}", serverConfig.AzureTenantId);
+            }
+
+            // Configure interactive authentication
+            options.ExcludeInteractiveBrowserCredential = !serverConfig.AllowInteractiveAuth;
+            if (serverConfig.AllowInteractiveAuth)
+            {
+                _logger.LogDebug("Interactive browser authentication enabled for server {ServerName}", serverConfig.Name);
+            }
+
+            // Create the credential
+            var credential = new DefaultAzureCredential(options);
+
+            // Prepare scopes - use default if none specified
+            var scopes = serverConfig.AzureScopes?.Count > 0 
+                ? serverConfig.AzureScopes.ToArray()
+                : new[] { "https://management.azure.com/.default" }; // Default Azure management scope
+
+            _logger.LogDebug("Requesting Azure token for scopes: {Scopes}", string.Join(", ", scopes));
+
+            // Get the access token
+            var tokenRequestContext = new TokenRequestContext(scopes);
+            var tokenResult = await credential.GetTokenAsync(tokenRequestContext);
+
+            // Set the authorization header
+            httpClient.DefaultRequestHeaders.Authorization = 
+                new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", tokenResult.Token);
+
+            _logger.LogInformation("Azure Identity authentication configured successfully for server {ServerName}", serverConfig.Name);
+            _logger.LogDebug("Token expires at: {ExpiresOn}", tokenResult.ExpiresOn);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to configure Azure Identity authentication for server {ServerName}: {Error}", 
+                serverConfig.Name, ex.Message);
+            throw new InvalidOperationException($"Azure Identity authentication failed for server {serverConfig.Name}: {ex.Message}", ex);
+        }
+    }
+
+    private async Task ConfigureGitHubAuthAsync(HttpClient httpClient, MultiMcpServerConfig serverConfig)
+    {
+        try
+        {
+            var authMethod = serverConfig.GitHubAuthMethod?.ToLower() ?? "cli";
+            _logger.LogInformation("Configuring GitHub authentication for server {ServerName} using method: {AuthMethod}", 
+                serverConfig.Name, authMethod);
+
+            string accessToken;
+
+            switch (authMethod)
+            {
+                case "device":
+                    // Prepare scopes - use default if none specified
+                    var deviceScopes = serverConfig.GitHubScopes?.Count > 0 
+                        ? serverConfig.GitHubScopes
+                        : new List<string> { "user", "repo" }; // Default GitHub scopes
+                    accessToken = await GetGitHubDeviceFlowTokenAsync(deviceScopes);
+                    break;
+                    
+                case "cli":
+                    accessToken = await GetGitHubCliTokenAsync();
+                    break;
+                    
+                case "token":
+                    accessToken = GetGitHubPersonalTokenAsync(serverConfig);
+                    break;
+                    
+                case "oauth":
+                    // Prepare scopes - use default if none specified
+                    var scopes = serverConfig.GitHubScopes?.Count > 0 
+                        ? serverConfig.GitHubScopes
+                        : new List<string> { "user", "repo" }; // Default GitHub scopes
+                    accessToken = await GetGitHubOAuthTokenAsync(serverConfig, scopes);
+                    break;
+                    
+                default:
+                    throw new InvalidOperationException($"Unknown GitHub authentication method: {authMethod}");
+            }
+
+            // Set the authorization header
+            httpClient.DefaultRequestHeaders.Authorization = 
+                new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken);
+
+            _logger.LogInformation("GitHub authentication configured successfully for server {ServerName}", serverConfig.Name);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to configure GitHub authentication for server {ServerName}: {Error}", 
+                serverConfig.Name, ex.Message);
+            throw new InvalidOperationException($"GitHub authentication failed for server {serverConfig.Name}: {ex.Message}", ex);
+        }
+    }
+
+    private async Task<string> GetGitHubDeviceFlowTokenAsync(List<string> scopes)
+    {
+        try
+        {
+            _logger.LogInformation("Starting GitHub device flow authentication");
+
+            using var httpClient = new HttpClient();
+            httpClient.DefaultRequestHeaders.Add("Accept", "application/json");
+            httpClient.DefaultRequestHeaders.Add("User-Agent", "mcpcli-github-auth");
+
+            // Step 1: Request device and user codes
+            var scopeString = string.Join(" ", scopes);
+            var deviceRequest = new
+            {
+                client_id = "Iv1.b507a08c87ecfe98", // GitHub CLI's public client ID
+                scope = scopeString
+            };
+
+            var deviceJson = JsonSerializer.Serialize(deviceRequest);
+            var deviceContent = new StringContent(deviceJson, System.Text.Encoding.UTF8, "application/json");
+
+            _logger.LogDebug("Requesting device code for scopes: {Scopes}", scopeString);
+            var deviceResponse = await httpClient.PostAsync("https://github.com/login/device/code", deviceContent);
+            deviceResponse.EnsureSuccessStatusCode();
+
+            var deviceResponseJson = await deviceResponse.Content.ReadAsStringAsync();
+            var deviceData = JsonSerializer.Deserialize<JsonElement>(deviceResponseJson);
+
+            var deviceCode = deviceData.GetProperty("device_code").GetString();
+            var userCode = deviceData.GetProperty("user_code").GetString();
+            var verificationUri = deviceData.GetProperty("verification_uri").GetString();
+            var interval = deviceData.GetProperty("interval").GetInt32();
+
+            // Step 2: Display instructions to user
+            Console.WriteLine();
+            Console.WriteLine("=== GitHub Authentication Required ===");
+            Console.WriteLine();
+            Console.WriteLine($"Please visit: {verificationUri}");
+            Console.WriteLine($"And enter code: {userCode}");
+            Console.WriteLine();
+            Console.WriteLine("Opening browser automatically...");
+            Console.WriteLine();
+
+            // Open browser automatically
+            try
+            {
+                var processStartInfo = new ProcessStartInfo(verificationUri)
+                {
+                    UseShellExecute = true,
+                    Verb = "open"
+                };
+                Process.Start(processStartInfo);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to open browser automatically");
+                Console.WriteLine("(Failed to open browser automatically - please visit the URL manually)");
+            }
+
+            // Step 3: Poll for access token
+            Console.WriteLine("Waiting for authorization...");
+            var pollingInterval = TimeSpan.FromSeconds(interval);
+            var timeout = TimeSpan.FromMinutes(10); // 10 minute timeout
+            var startTime = DateTime.UtcNow;
+
+            while (DateTime.UtcNow - startTime < timeout)
+            {
+                await Task.Delay(pollingInterval);
+
+                var tokenRequest = new
+                {
+                    client_id = "Iv1.b507a08c87ecfe98", // GitHub CLI's public client ID
+                    device_code = deviceCode,
+                    grant_type = "urn:ietf:params:oauth:grant-type:device_code"
+                };
+
+                var tokenJson = JsonSerializer.Serialize(tokenRequest);
+                var tokenContent = new StringContent(tokenJson, System.Text.Encoding.UTF8, "application/json");
+
+                var tokenResponse = await httpClient.PostAsync("https://github.com/login/oauth/access_token", tokenContent);
+                var tokenResponseJson = await tokenResponse.Content.ReadAsStringAsync();
+                var tokenData = JsonSerializer.Deserialize<JsonElement>(tokenResponseJson);
+
+                if (tokenData.TryGetProperty("access_token", out var accessTokenElement))
+                {
+                    var accessToken = accessTokenElement.GetString();
+                    if (!string.IsNullOrEmpty(accessToken))
+                    {
+                        Console.WriteLine("✅ Successfully authenticated with GitHub!");
+                        Console.WriteLine();
+                        _logger.LogInformation("GitHub device flow authentication completed successfully");
+                        return accessToken;
+                    }
+                }
+
+                if (tokenData.TryGetProperty("error", out var errorElement))
+                {
+                    var error = errorElement.GetString();
+                    if (error == "authorization_pending")
+                    {
+                        // Still waiting for user authorization
+                        Console.Write(".");
+                        continue;
+                    }
+                    if (error == "slow_down")
+                    {
+                        // GitHub wants us to slow down polling
+                        pollingInterval = pollingInterval.Add(TimeSpan.FromSeconds(5));
+                        continue;
+                    }
+                    if (error == "expired_token")
+                    {
+                        throw new InvalidOperationException("Device code expired. Please try again.");
+                    }
+                    if (error == "access_denied")
+                    {
+                        throw new InvalidOperationException("User cancelled the authorization.");
+                    }
+
+                    throw new InvalidOperationException($"GitHub authentication error: {error}");
+                }
+            }
+
+            throw new InvalidOperationException("GitHub authentication timed out. Please try again.");
+        }
+        catch (Exception ex) when (ex is not InvalidOperationException)
+        {
+            _logger.LogError(ex, "Failed to complete GitHub device flow authentication");
+            throw new InvalidOperationException($"GitHub device flow authentication failed: {ex.Message}", ex);
+        }
+    }
+
+    private async Task<string> GetGitHubCliTokenAsync()
+    {
+        try
+        {
+            _logger.LogInformation("Attempting to get GitHub token from GitHub CLI");
+
+            var processStartInfo = new ProcessStartInfo
+            {
+                FileName = "gh",
+                Arguments = "auth token",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            using var process = Process.Start(processStartInfo);
+            if (process == null)
+            {
+                throw new InvalidOperationException("Failed to start GitHub CLI process");
+            }
+
+            await process.WaitForExitAsync();
+
+            if (process.ExitCode != 0)
+            {
+                var error = await process.StandardError.ReadToEndAsync();
+                throw new InvalidOperationException($"GitHub CLI authentication failed: {error}. Please run 'gh auth login' first.");
+            }
+
+            var token = (await process.StandardOutput.ReadToEndAsync()).Trim();
+            if (string.IsNullOrEmpty(token))
+            {
+                throw new InvalidOperationException("GitHub CLI returned empty token. Please run 'gh auth login' first.");
+            }
+
+            _logger.LogInformation("Successfully obtained GitHub token from CLI");
+            return token;
+        }
+        catch (Exception ex) when (ex is not InvalidOperationException)
+        {
+            _logger.LogError(ex, "Failed to get GitHub token from CLI");
+            throw new InvalidOperationException($"GitHub CLI authentication failed: {ex.Message}. Make sure GitHub CLI is installed and authenticated.", ex);
+        }
+    }
+
+    private string GetGitHubPersonalTokenAsync(MultiMcpServerConfig serverConfig)
+    {
+        if (string.IsNullOrEmpty(serverConfig.GitHubToken))
+        {
+            throw new InvalidOperationException("GitHub personal access token is required when using 'token' authentication method");
+        }
+
+        _logger.LogInformation("Using configured GitHub personal access token");
+        return serverConfig.GitHubToken;
+    }
+
+    private async Task<string> GetGitHubOAuthTokenAsync(MultiMcpServerConfig serverConfig, List<string> scopes)
+    {
+        // Check for required OAuth parameters
+        if (string.IsNullOrEmpty(serverConfig.GitHubClientId))
+        {
+            throw new InvalidOperationException("GitHub Client ID is required for OAuth authentication");
+        }
+
+        if (string.IsNullOrEmpty(serverConfig.GitHubClientSecret))
+        {
+            throw new InvalidOperationException("GitHub Client Secret is required for OAuth authentication");
+        }
+
+        if (!serverConfig.AllowGitHubInteractiveAuth)
+        {
+            throw new InvalidOperationException("Interactive authentication is disabled, but no cached token is available");
+        }
+
+        _logger.LogDebug("Requesting GitHub OAuth token for scopes: {Scopes}", string.Join(", ", scopes));
+
+        _logger.LogInformation("Starting GitHub OAuth interactive flow");
+        
+        // Start local HTTP listener for OAuth callback
+        var listener = new HttpListener();
+        var redirectUri = "http://localhost:8080/callback";
+        listener.Prefixes.Add("http://localhost:8080/");
+        listener.Start();
+
+        try
+        {
+            // Create authorization URL
+            var state = Guid.NewGuid().ToString();
+            var scopeString = string.Join(",", scopes);
+            var authUrl = $"https://github.com/login/oauth/authorize?" +
+                         $"client_id={serverConfig.GitHubClientId}&" +
+                         $"redirect_uri={Uri.EscapeDataString(redirectUri)}&" +
+                         $"scope={Uri.EscapeDataString(scopeString)}&" +
+                         $"state={state}";
+
+            _logger.LogInformation("Opening browser for GitHub OAuth authorization");
+            _logger.LogDebug("Authorization URL: {AuthUrl}", authUrl);
+
+            // Open browser
+            var processStartInfo = new ProcessStartInfo(authUrl)
+            {
+                UseShellExecute = true,
+                Verb = "open"
+            };
+            Process.Start(processStartInfo);
+
+            // Wait for callback
+            _logger.LogInformation("Waiting for OAuth callback...");
+            var context = await listener.GetContextAsync();
+            var request = context.Request;
+            var response = context.Response;
+
+            // Extract authorization code
+            var query = request.Url?.Query;
+            if (string.IsNullOrEmpty(query))
+            {
+                throw new InvalidOperationException("No query parameters received in OAuth callback");
+            }
+
+            var queryParams = System.Web.HttpUtility.ParseQueryString(query);
+            var code = queryParams["code"];
+            var returnedState = queryParams["state"];
+            var error = queryParams["error"];
+
+            if (!string.IsNullOrEmpty(error))
+            {
+                throw new InvalidOperationException($"OAuth authorization failed: {error}");
+            }
+
+            if (returnedState != state)
+            {
+                throw new InvalidOperationException("OAuth state mismatch - possible CSRF attack");
+            }
+
+            if (string.IsNullOrEmpty(code))
+            {
+                throw new InvalidOperationException("No authorization code received");
+            }
+
+            // Send success response to browser
+            var responseString = "<html><body><h1>Authorization Successful!</h1><p>You can close this window and return to the application.</p></body></html>";
+            var buffer = System.Text.Encoding.UTF8.GetBytes(responseString);
+            response.ContentType = "text/html";
+            response.ContentLength64 = buffer.Length;
+            await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
+            response.OutputStream.Close();
+
+            _logger.LogInformation("Authorization code received, exchanging for access token");
+
+            // Exchange code for access token
+            var tokenRequest = new
+            {
+                client_id = serverConfig.GitHubClientId,
+                client_secret = serverConfig.GitHubClientSecret,
+                code = code,
+                redirect_uri = redirectUri
+            };
+
+            var tokenJson = JsonSerializer.Serialize(tokenRequest);
+            var tokenContent = new StringContent(tokenJson, System.Text.Encoding.UTF8, "application/json");
+
+            using var tokenHttpClient = new HttpClient();
+            tokenHttpClient.DefaultRequestHeaders.Add("Accept", "application/json");
+            tokenHttpClient.DefaultRequestHeaders.Add("User-Agent", "mcpcli-oauth");
+
+            var tokenResponse = await tokenHttpClient.PostAsync("https://github.com/login/oauth/access_token", tokenContent);
+            tokenResponse.EnsureSuccessStatusCode();
+
+            var tokenResponseJson = await tokenResponse.Content.ReadAsStringAsync();
+            var tokenData = JsonSerializer.Deserialize<JsonElement>(tokenResponseJson);
+
+            if (!tokenData.TryGetProperty("access_token", out var accessTokenElement))
+            {
+                var errorDescription = tokenData.TryGetProperty("error_description", out var desc) 
+                    ? desc.GetString() 
+                    : "Unknown error";
+                throw new InvalidOperationException($"Failed to obtain access token: {errorDescription}");
+            }
+
+            var accessToken = accessTokenElement.GetString();
+            if (string.IsNullOrEmpty(accessToken))
+            {
+                throw new InvalidOperationException("Received empty access token");
+            }
+
+            _logger.LogInformation("GitHub OAuth access token obtained successfully");
+            return accessToken;
+        }
+        finally
+        {
+            listener.Stop();
+        }
     }
 
     private async Task StopIndividualServerAsync(RunningServerInfo server)
@@ -566,7 +1044,18 @@ public class MultiMcpServerService : IMultiMcpServerService
         var json = JsonSerializer.Serialize(request);
         var content = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
 
-        var response = await httpClient.PostAsync(server.Url, content);
+        _logger.LogDebug("Sending tools/list request to {ServerName}: {RequestJson}", server.Name, json);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var response = await httpClient.PostAsync(server.Url, content, cts.Token);
+        
+        if (!response.IsSuccessStatusCode)
+        {
+            var errorContent = await response.Content.ReadAsStringAsync();
+            _logger.LogError("Tools discovery failed for {ServerName}. Status: {StatusCode}, Response: {Response}", 
+                server.Name, response.StatusCode, errorContent);
+        }
+        
         response.EnsureSuccessStatusCode();
 
         var responseJson = await response.Content.ReadAsStringAsync();
@@ -650,7 +1139,8 @@ public class MultiMcpServerService : IMultiMcpServerService
         var json = JsonSerializer.Serialize(request);
         var content = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
 
-        var response = await httpClient.PostAsync(server.Url, content);
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var response = await httpClient.PostAsync(server.Url, content, cts.Token);
         response.EnsureSuccessStatusCode();
 
         var responseJson = await response.Content.ReadAsStringAsync();
@@ -694,8 +1184,16 @@ public class MultiMcpServerService : IMultiMcpServerService
             else if (server.Type == "http")
             {
                 // Check if HTTP server is responding
-                health.IsHealthy = await IsHttpServerRespondingAsync(server.Url);
-                health.Status = health.IsHealthy ? "Responding" : "Not Responding";
+                if (_httpClients.TryGetValue(server.Name, out var httpClient))
+                {
+                    health.IsHealthy = await IsHttpServerRespondingAsync(httpClient, server.Url);
+                    health.Status = health.IsHealthy ? "Responding" : "Not Responding";
+                }
+                else
+                {
+                    health.IsHealthy = false;
+                    health.Status = "No HttpClient";
+                }
             }
         }
         catch (Exception ex)
@@ -738,15 +1236,48 @@ public class MultiMcpServerService : IMultiMcpServerService
         }
     }
 
-    private async Task<bool> IsHttpServerRespondingAsync(string url)
+    private async Task<bool> IsHttpServerRespondingAsync(HttpClient httpClient, string url)
     {
         try
         {
-            var response = await _httpClient.GetAsync(url);
+            _logger.LogDebug("Testing connection to {Url}", url);
+            
+            // For MCP servers, test with a simple initialization request
+            var initRequest = new
+            {
+                jsonrpc = "2.0",
+                id = 1,
+                method = "initialize",
+                @params = new
+                {
+                    protocolVersion = "2024-11-05",
+                    capabilities = new { },
+                    clientInfo = new
+                    {
+                        name = "mcpcli",
+                        version = "1.0.0"
+                    }
+                }
+            };
+
+            var json = JsonSerializer.Serialize(initRequest);
+            var content = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
+            
+            // Use a shorter timeout for the connection test
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            var response = await httpClient.PostAsync(url, content, cts.Token);
+            
+            _logger.LogDebug("Received response from {Url}: {StatusCode}", url, response.StatusCode);
             return response.IsSuccessStatusCode;
         }
-        catch
+        catch (OperationCanceledException)
         {
+            _logger.LogWarning("Connection test to {Url} timed out after 15 seconds", url);
+            return false;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Connection test to {Url} failed: {Message}", url, ex.Message);
             return false;
         }
     }

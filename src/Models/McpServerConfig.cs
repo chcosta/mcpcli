@@ -17,8 +17,27 @@ public class MultiMcpServerConfig
     
     // HTTP-specific properties
     public Dictionary<string, string> Headers { get; set; } = new();
-    public string? AuthType { get; set; } // "bearer", "basic", "apikey", etc.
+    public string? AuthType { get; set; } // "bearer", "basic", "apikey", "azure_identity", etc.
     public string? AuthToken { get; set; }
+    
+    // Azure Identity authentication properties
+    public bool UseAzureIdentity { get; set; } = false;
+    public List<string> AzureScopes { get; set; } = new();
+    public string? AzureTenantId { get; set; }
+    public bool AllowInteractiveAuth { get; set; } = true;
+    
+    // GitHub authentication properties
+    public bool UseGitHubAuth { get; set; } = false;
+    public string? GitHubAuthMethod { get; set; } = "device"; // "device", "cli", "token", "oauth"
+    public List<string> GitHubScopes { get; set; } = new();
+    
+    // OAuth-specific properties (only used when GitHubAuthMethod = "oauth")
+    public string? GitHubClientId { get; set; }
+    public string? GitHubClientSecret { get; set; }
+    public bool AllowGitHubInteractiveAuth { get; set; } = true;
+    
+    // Token-specific properties (only used when GitHubAuthMethod = "token")
+    public string? GitHubToken { get; set; }
     
     // Git-specific properties  
     public string? Branch { get; set; }
