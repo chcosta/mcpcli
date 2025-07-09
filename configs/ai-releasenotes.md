@@ -1,7 +1,7 @@
 ---
 name: AI Release Notes
 description: ".NET Engineering's Azure DevOps integration server"
-preview_features: false
+preview_features: true
 azure_ai:
   endpoint: "https://andya-ma8fyz00-eastus2.openai.azure.com/"
   api_key: "${azure_ai_api_key}"
@@ -15,7 +15,7 @@ servers:
     type: "http"
     url: "https://api.githubcopilot.com/mcp/"
     description: "GitHub's official remote MCP server for GitHub API access"
-    enabled: true
+    enabled: false
     headers:
       # PAT scopes: repo, read:user, copilot
       Authorization: "Bearer ${github_copilot_pat}"

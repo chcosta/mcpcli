@@ -10,6 +10,9 @@ class Program
 {
     static async Task<int> Main(string[] args)
     {
+        Console.WriteLine("MCP CLI starting...");
+        Console.WriteLine($"Arguments: {string.Join(" ", args)}");
+        
         // Set up dependency injection
         var services = new ServiceCollection();
         ConfigureServices(services);
@@ -21,6 +24,8 @@ class Program
             Name = "mcpcli"
         };
 
+        Console.WriteLine("Creating commands...");
+
         // Add commands
         var connectCommand = serviceProvider.GetRequiredService<ConnectCommand>();
         var configCommand = serviceProvider.GetRequiredService<ConfigCommand>();
@@ -29,6 +34,7 @@ class Program
         var runCommand = serviceProvider.GetRequiredService<RunCommand>();
         var templateCommand = serviceProvider.GetRequiredService<TemplateCommand>();
         var serverCommand = serviceProvider.GetRequiredService<ServerCommand>();
+        var planCommand = serviceProvider.GetRequiredService<PlanCommand>();
 
         rootCommand.AddCommand(connectCommand.CreateCommand());
         rootCommand.AddCommand(configCommand.CreateCommand());
@@ -37,17 +43,24 @@ class Program
         rootCommand.AddCommand(runCommand.CreateCommand());
         rootCommand.AddCommand(templateCommand.CreateCommand());
         rootCommand.AddCommand(serverCommand.CreateCommand());
+        rootCommand.AddCommand(planCommand.CreateCommand());
+
+        Console.WriteLine("Commands created successfully");
 
         // Execute the command
         try
         {
-            return await rootCommand.InvokeAsync(args);
+            Console.WriteLine("Invoking command...");
+            var result = await rootCommand.InvokeAsync(args);
+            Console.WriteLine($"Command completed with exit code: {result}");
+            return result;
         }
         catch (Exception ex)
         {
             var logger = serviceProvider.GetRequiredService<ILogger<Program>>();
             logger.LogError(ex, "An unexpected error occurred");
             Console.WriteLine($"Error: {ex.Message}");
+            Console.WriteLine($"Stack trace: {ex.StackTrace}");
             return 1;
         }
     }
@@ -73,8 +86,21 @@ class Program
         services.AddScoped<IPromptFileService, PromptFileService>();
         services.AddScoped<ISystemPromptService, SystemPromptService>();
         services.AddScoped<IEnvironmentVariableService, EnvironmentVariableService>();
-        services.AddScoped<IAiPlanningService, AiPlanningService>();
+        services.AddScoped<IRepositoryRootService, RepositoryRootService>();
+
         services.AddScoped<IMultiMcpServerService, MultiMcpServerService>();
+        
+        // Planning Services
+        services.AddScoped<IPlanGenerator, AiPlanGenerator>();
+        services.AddScoped<IPlanExecutor, AdvancedPlanExecutor>();
+        services.AddScoped<IPlanPersistenceService, PlanPersistenceService>();
+        services.AddScoped<PlanValidator>();
+        services.AddScoped<StepContextManager>();
+        services.AddScoped<AdvancedContextManager>();
+        services.AddScoped<StepCommunicationService>();
+        services.AddSingleton<ContextOptimizationService>();
+        services.AddSingleton<PlanExecutionMonitor>();
+        services.AddSingleton<PlanExecutionController>();
 
         // Commands
         services.AddScoped<ConnectCommand>();
@@ -84,5 +110,6 @@ class Program
         services.AddScoped<RunCommand>();
         services.AddScoped<TemplateCommand>();
         services.AddScoped<ServerCommand>();
+        services.AddScoped<PlanCommand>();
     }
 }

@@ -9,6 +9,9 @@ public class ExecutionSummary
     public List<string> ConfigurationFilesRead { get; set; } = new();
     public List<string> PromptFilesRead { get; set; } = new();
     public List<string> OtherMarkdownFilesRead { get; set; } = new();
+    public List<string> SystemPromptFilesRead { get; set; } = new();
+    public List<string> PlanFilesRead { get; set; } = new();
+    public List<string> StepResultFilesRead { get; set; } = new();
     public List<string> ToolsExecuted { get; set; } = new();
     public bool PreviewFeaturesEnabled { get; set; }
     public string? ExecutionMode { get; set; }
@@ -57,6 +60,30 @@ public class ExecutionSummary
         if (!string.IsNullOrEmpty(filePath) && !OtherMarkdownFilesRead.Contains(filePath))
         {
             OtherMarkdownFilesRead.Add(filePath);
+        }
+    }
+
+    public void AddSystemPromptFileRead(string filePath)
+    {
+        if (!string.IsNullOrEmpty(filePath) && !SystemPromptFilesRead.Contains(filePath))
+        {
+            SystemPromptFilesRead.Add(filePath);
+        }
+    }
+
+    public void AddPlanFileRead(string filePath)
+    {
+        if (!string.IsNullOrEmpty(filePath) && !PlanFilesRead.Contains(filePath))
+        {
+            PlanFilesRead.Add(filePath);
+        }
+    }
+
+    public void AddStepResultFileRead(string filePath)
+    {
+        if (!string.IsNullOrEmpty(filePath) && !StepResultFilesRead.Contains(filePath))
+        {
+            StepResultFilesRead.Add(filePath);
         }
     }
 

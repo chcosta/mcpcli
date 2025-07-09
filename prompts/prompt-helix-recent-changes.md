@@ -16,7 +16,7 @@ steps:
     required_tools: ["initialize_azure_dev_ops_client"]
   - name: "Find Latest Production Deployment Before Cutoff"
     description: "Find the most recent production deployment before the specified cutoff date"
-    instruction: "Find the most recent pull request in the {project_name} project's {repository_name} repository that was merged to the {production_branch} branch AND was completed (closed) before {cutoff_date}. Use closed date filtering to ensure we get PRs that were completed before the cutoff date."
+    instruction: "Find the most recent pull request in the {project_name} project's {repository_name} repository that was merged to the {production_branch} branch AND was completed (closed) before {cutoff_date}. Use closed date filtering to ensure we get PRs that were completed before the cutoff date, limit to one pull request."
     required_tools: ["get_pull_requests_by_closed_date"]
   - name: "Analyze Recent Main Branch Changes"
     description: "List all pull requests merged to main after the production deployment"

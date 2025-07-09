@@ -524,6 +524,90 @@ public class McpServerService : IMcpServerService
         }
     }
 
+    public async Task<Dictionary<string, object>> GetToolSchemasAsync(McpServerInfo serverInfo, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var request = new McpRequest
+            {
+                Method = "tools/list",
+                Params = null
+            };
+
+            var response = await SendRequestAsync(serverInfo, request, cancellationToken);
+            
+            if (response.Error != null)
+            {
+                _logger.LogWarning("Error getting tool schemas: {Error}", response.Error.Message);
+                return new Dictionary<string, object>();
+            }
+
+            if (response.Result != null)
+            {
+                // Parse the MCP tools response format
+                var resultJson = JsonSerializer.Serialize(response.Result);
+                _logger.LogDebug("Tool schemas response: {Response}", resultJson);
+                
+                try
+                {
+                    // Parse the MCP tools/list response format
+                    var toolsResponse = JsonSerializer.Deserialize<JsonElement>(resultJson);
+                    
+                    if (toolsResponse.TryGetProperty("tools", out var toolsArray) && toolsArray.ValueKind == JsonValueKind.Array)
+                    {
+                        var toolSchemas = new Dictionary<string, object>();
+                        
+                        foreach (var tool in toolsArray.EnumerateArray())
+                        {
+                            if (tool.TryGetProperty("name", out var nameElement) && nameElement.ValueKind == JsonValueKind.String)
+                            {
+                                var toolName = nameElement.GetString();
+                                if (!string.IsNullOrEmpty(toolName))
+                                {
+                                    var schema = new Dictionary<string, object>();
+                                    
+                                    // Get description
+                                    if (tool.TryGetProperty("description", out var descElement))
+                                    {
+                                        schema["description"] = descElement.GetString() ?? "";
+                                    }
+                                    
+                                    // Get input schema (parameters)
+                                    if (tool.TryGetProperty("inputSchema", out var inputSchemaElement))
+                                    {
+                                        schema["inputSchema"] = JsonSerializer.Deserialize<object>(inputSchemaElement.GetRawText()) ?? new object();
+                                    }
+                                    
+                                    toolSchemas[toolName] = schema;
+                                    _logger.LogDebug("Found tool schema: {ToolName} with {PropertiesCount} properties", toolName, schema.Count);
+                                }
+                            }
+                        }
+                        
+                        return toolSchemas;
+                    }
+                    else
+                    {
+                        _logger.LogWarning("Tools response does not contain expected 'tools' array");
+                        return new Dictionary<string, object>();
+                    }
+                }
+                catch (JsonException ex)
+                {
+                    _logger.LogError(ex, "Error parsing tool schemas response JSON: {Response}", resultJson);
+                    return new Dictionary<string, object>();
+                }
+            }
+
+            return new Dictionary<string, object>();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting tool schemas");
+            return new Dictionary<string, object>();
+        }
+    }
+
     public async Task<McpServerInfo> DiscoverServerConfigurationAsync(string repositoryPath)
     {
         try

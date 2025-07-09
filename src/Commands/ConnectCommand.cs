@@ -11,19 +11,22 @@ public class ConnectCommand
     private readonly IMcpServerService _mcpServerService;
     private readonly IAzureAiService _azureAiService;
     private readonly IConfigurationService _configurationService;
+    private readonly IRepositoryRootService _repositoryRootService;
 
     public ConnectCommand(
         ILogger<ConnectCommand> logger,
         IGitService gitService,
         IMcpServerService mcpServerService,
         IAzureAiService azureAiService,
-        IConfigurationService configurationService)
+        IConfigurationService configurationService,
+        IRepositoryRootService repositoryRootService)
     {
         _logger = logger;
         _gitService = gitService;
         _mcpServerService = mcpServerService;
         _azureAiService = azureAiService;
         _configurationService = configurationService;
+        _repositoryRootService = repositoryRootService;
     }
 
     public Command CreateCommand()
@@ -102,9 +105,14 @@ public class ConnectCommand
                 _gitService.SetAzureDevOpsCredentials(config.AzureDevOps.Organization, config.AzureDevOps.PersonalAccessToken);
             }
 
+            // Resolve working directory relative to repository root
+            var resolvedWorkingDir = _repositoryRootService.IsRelativePath(workingDir) 
+                ? _repositoryRootService.ResolvePath(workingDir) 
+                : workingDir;
+
             // Get repository name and local path
             var repoName = _gitService.GetRepositoryNameFromUrl(repository);
-            var localPath = Path.Combine(workingDir, repoName);
+            var localPath = Path.Combine(resolvedWorkingDir, repoName);
 
             // Clone or update repository
             if (forceClone || !await _gitService.IsRepositoryClonedAsync(localPath))

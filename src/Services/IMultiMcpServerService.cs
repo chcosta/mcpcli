@@ -25,7 +25,7 @@ public interface IMultiMcpServerService
     /// <param name="runningServers">List of running servers</param>
     /// <returns>Consolidated list of available tools with server mapping</returns>
     Task<ServerToolMapping> GetAvailableToolsAsync(List<RunningServerInfo> runningServers);
-
+    Task<Dictionary<string, object>> GetToolSchemasAsync(RunningServerInfo serverInfo);
     /// <summary>
     /// Calls a tool on the appropriate server
     /// </summary>

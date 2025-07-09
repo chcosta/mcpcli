@@ -1,0 +1,3 @@
+# MCP CLI Repository Root Marker
+# This file marks the root of the MCP CLI repository
+# All relative paths in configuration files are resolved relative to this directory 

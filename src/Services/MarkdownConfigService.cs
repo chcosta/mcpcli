@@ -10,23 +10,30 @@ public class MarkdownConfigService : IMarkdownConfigService
 {
     private readonly ILogger<MarkdownConfigService> _logger;
     private readonly IEnvironmentVariableService _environmentVariableService;
+    private readonly IRepositoryRootService _repositoryRootService;
 
-    public MarkdownConfigService(ILogger<MarkdownConfigService> logger, IEnvironmentVariableService environmentVariableService)
+    public MarkdownConfigService(ILogger<MarkdownConfigService> logger, IEnvironmentVariableService environmentVariableService, IRepositoryRootService repositoryRootService)
     {
         _logger = logger;
         _environmentVariableService = environmentVariableService;
+        _repositoryRootService = repositoryRootService;
     }
 
     public async Task<MarkdownConfig> ParseMarkdownConfigAsync(string filePath)
     {
         try
         {
-            if (!File.Exists(filePath))
+            // Resolve relative paths relative to repository root
+            var resolvedFilePath = _repositoryRootService.IsRelativePath(filePath) 
+                ? _repositoryRootService.ResolvePath(filePath) 
+                : filePath;
+
+            if (!File.Exists(resolvedFilePath))
             {
-                throw new FileNotFoundException($"Configuration file not found: {filePath}");
+                throw new FileNotFoundException($"Configuration file not found: {resolvedFilePath}");
             }
 
-            var content = await File.ReadAllTextAsync(filePath);
+            var content = await File.ReadAllTextAsync(resolvedFilePath);
             return await ParseMarkdownConfigFromContentAsync(content);
         }
         catch (Exception ex)

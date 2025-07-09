@@ -12,5 +12,6 @@ public interface IMcpServerService
     Task<string> CallToolAsync(McpServerInfo serverInfo, string toolName, Dictionary<string, object> parameters, CancellationToken cancellationToken = default);
     Task<string> CallToolAsync(McpServerInfo serverInfo, string toolName, Dictionary<string, object> parameters, Dictionary<string, Dictionary<string, object>>? toolDefaults, CancellationToken cancellationToken = default);
     Task<IEnumerable<string>> GetAvailableToolsAsync(McpServerInfo serverInfo, CancellationToken cancellationToken = default);
+    Task<Dictionary<string, object>> GetToolSchemasAsync(McpServerInfo serverInfo, CancellationToken cancellationToken = default);
     Task<McpServerInfo> DiscoverServerConfigurationAsync(string repositoryPath);
 } 

@@ -16,6 +16,7 @@ public class MultiMcpServerService : IMultiMcpServerService
     private readonly IGitService _gitService;
     private readonly IMcpServerService _mcpServerService;
     private readonly IEnvironmentVariableService _environmentVariableService;
+    private readonly IRepositoryRootService _repositoryRootService;
     private readonly Dictionary<string, Process> _runningProcesses = new();
     private readonly Dictionary<string, HttpClient> _httpClients = new();
     private readonly Dictionary<string, DateTime> _lastHealthCheck = new();
@@ -25,13 +26,15 @@ public class MultiMcpServerService : IMultiMcpServerService
         HttpClient httpClient,
         IGitService gitService,
         IMcpServerService mcpServerService,
-        IEnvironmentVariableService environmentVariableService)
+        IEnvironmentVariableService environmentVariableService,
+        IRepositoryRootService repositoryRootService)
     {
         _logger = logger;
         _httpClient = httpClient;
         _gitService = gitService;
         _mcpServerService = mcpServerService;
         _environmentVariableService = environmentVariableService;
+        _repositoryRootService = repositoryRootService;
     }
 
     public async Task<List<RunningServerInfo>> StartServersAsync(MarkdownConfig config, string workingDir, ExecutionSummary? executionSummary = null)
@@ -95,58 +98,61 @@ public class MultiMcpServerService : IMultiMcpServerService
 
     public async Task<ServerToolMapping> GetAvailableToolsAsync(List<RunningServerInfo> runningServers)
     {
-        var mapping = new ServerToolMapping();
-        
-        var toolDiscoveryTasks = runningServers
-            .Where(s => s.IsRunning)
-            .Select(async server =>
-            {
-                try
-                {
-                    var tools = await GetServerToolsAsync(server);
-                    return new { Server = server, Tools = tools };
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Error getting tools from server {ServerName}", server.Name);
-                    return new { Server = server, Tools = new List<string>() };
-                }
-            });
+        var toolMapping = new ServerToolMapping();
+        var tasks = new List<Task<(string serverName, IEnumerable<string> tools)>>();
 
-        var results = await Task.WhenAll(toolDiscoveryTasks);
-
-        foreach (var result in results)
+        foreach (var serverInfo in runningServers.Where(s => s.IsRunning))
         {
-            mapping.ServerToTools[result.Server.Name] = result.Tools.ToList();
+            tasks.Add(GetToolsForServerAsync(serverInfo));
+        }
+
+        var results = await Task.WhenAll(tasks);
+
+        foreach (var (serverName, tools) in results)
+        {
+            toolMapping.ServerToTools[serverName] = tools.ToList();
             
-            foreach (var tool in result.Tools)
+            foreach (var tool in tools)
             {
-                mapping.AllTools.Add(tool);
-                
-                // Handle tool conflicts
-                if (mapping.ToolToServer.ContainsKey(tool))
+                if (toolMapping.ToolToServer.ContainsKey(tool))
                 {
-                    // Tool exists on multiple servers - track conflict
-                    if (!mapping.ConflictingTools.ContainsKey(tool))
+                    // Tool exists on multiple servers - mark as conflicting
+                    if (!toolMapping.ConflictingTools.ContainsKey(tool))
                     {
-                        mapping.ConflictingTools[tool] = new List<string> { mapping.ToolToServer[tool] };
+                        toolMapping.ConflictingTools[tool] = new List<string> { toolMapping.ToolToServer[tool] };
                     }
-                    mapping.ConflictingTools[tool].Add(result.Server.Name);
-                    
-                    _logger.LogWarning("Tool conflict detected: {ToolName} exists on servers {Servers}", 
-                        tool, string.Join(", ", mapping.ConflictingTools[tool]));
+                    toolMapping.ConflictingTools[tool].Add(serverName);
                 }
                 else
                 {
-                    mapping.ToolToServer[tool] = result.Server.Name;
+                    toolMapping.ToolToServer[tool] = serverName;
+                    toolMapping.AllTools.Add(tool);
                 }
             }
         }
 
-        _logger.LogInformation("Discovered {ToolCount} tools across {ServerCount} servers", 
-            mapping.AllTools.Count, runningServers.Count);
+        return toolMapping;
+    }
 
-        return mapping;
+    public async Task<Dictionary<string, object>> GetToolSchemasAsync(RunningServerInfo serverInfo)
+    {
+        try
+        {
+            var mcpServerInfo = new McpServerInfo
+            {
+                Name = serverInfo.Name,
+                Port = serverInfo.Port,
+                LocalPath = serverInfo.LocalPath,
+                IsRunning = serverInfo.IsRunning
+            };
+
+            return await _mcpServerService.GetToolSchemasAsync(mcpServerInfo);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting tool schemas for server {ServerName}", serverInfo.Name);
+            return new Dictionary<string, object>();
+        }
     }
 
     public async Task<string> CallToolAsync(string toolName, Dictionary<string, object> parameters, 
@@ -383,13 +389,25 @@ public class MultiMcpServerService : IMultiMcpServerService
     private async Task StartGitServerAsync(MultiMcpServerConfig serverConfig, string workingDir, 
         PortManager portManager, RunningServerInfo runningServer)
     {
-        // Assign port if not specified or if port is taken
+        // Resolve working directory relative to repository root
+        var resolvedWorkingDir = _repositoryRootService.IsRelativePath(workingDir) 
+            ? _repositoryRootService.ResolvePath(workingDir) 
+            : workingDir;
+
+        // Ensure working directory exists
+        if (!Directory.Exists(resolvedWorkingDir))
+        {
+            Directory.CreateDirectory(resolvedWorkingDir);
+            _logger.LogInformation("Created working directory: {WorkingDir}", resolvedWorkingDir);
+        }
+
+        // Get available port
         var port = await portManager.GetAvailablePortAsync(serverConfig.Port);
         runningServer.Port = port;
 
         // Determine local path for the repository
         var repoName = _gitService.GetRepositoryNameFromUrl(serverConfig.Url);
-        var localPath = Path.Combine(workingDir, "servers", repoName);
+        var localPath = Path.Combine(resolvedWorkingDir, "servers", repoName);
         runningServer.LocalPath = localPath;
 
         // Clone or update repository
@@ -984,29 +1002,191 @@ public class MultiMcpServerService : IMultiMcpServerService
         _logger.LogInformation("Stopped server {ServerName}", server.Name);
     }
 
-    private async Task<List<string>> GetServerToolsAsync(RunningServerInfo server)
+    private async Task<(string serverName, IEnumerable<string> tools)> GetToolsForServerAsync(RunningServerInfo server)
     {
         try
         {
             if (server.Type == "git")
             {
-                return await GetGitServerToolsAsync(server);
+                return (server.Name, await GetGitServerToolsAsync(server));
             }
             else if (server.Type == "http")
             {
-                return await GetHttpServerToolsAsync(server);
+                return (server.Name, await GetHttpServerToolsAsync(server));
             }
             else
             {
                 _logger.LogWarning("Unknown server type for tools discovery: {ServerType}", server.Type);
-                return new List<string>();
+                return (server.Name, new List<string>());
             }
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error getting tools from server {ServerName}", server.Name);
-            return new List<string>();
+            return (server.Name, new List<string>());
         }
+    }
+
+    private async Task<Dictionary<string, string>> GetServerToolDescriptionsAsync(RunningServerInfo server, List<string> tools)
+    {
+        var descriptions = new Dictionary<string, string>();
+        
+        try
+        {
+            if (server.Type == "git")
+            {
+                return await GetGitServerToolDescriptionsAsync(server, tools);
+            }
+            else if (server.Type == "http")
+            {
+                return await GetHttpServerToolDescriptionsAsync(server, tools);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error getting tool descriptions from server {ServerName}, using basic descriptions", server.Name);
+        }
+        
+        // Fallback: provide basic descriptions
+        foreach (var tool in tools)
+        {
+            descriptions[tool] = GetBasicToolDescription(tool);
+        }
+        
+        return descriptions;
+    }
+
+    private async Task<Dictionary<string, string>> GetGitServerToolDescriptionsAsync(RunningServerInfo server, List<string> tools)
+    {
+        var descriptions = new Dictionary<string, string>();
+        
+        try
+        {
+            // Try to get tool descriptions from the MCP server
+            var processKey = $"{server.Name}:{server.Port}";
+            if (_runningProcesses.TryGetValue(processKey, out var process))
+            {
+                // For now, we'll use basic descriptions since MCP tool descriptions require more complex parsing
+                // In the future, this could query the MCP server for tool metadata
+                foreach (var tool in tools)
+                {
+                    descriptions[tool] = GetBasicToolDescription(tool);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error getting tool descriptions from git server {ServerName}", server.Name);
+        }
+        
+        return descriptions;
+    }
+
+    private Task<Dictionary<string, string>> GetHttpServerToolDescriptionsAsync(RunningServerInfo server, List<string> tools)
+    {
+        var descriptions = new Dictionary<string, string>();
+        
+        try
+        {
+            // For HTTP servers, we could potentially query the server for tool metadata
+            // For now, use basic descriptions
+            foreach (var tool in tools)
+            {
+                descriptions[tool] = GetBasicToolDescription(tool);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error getting tool descriptions from HTTP server {ServerName}", server.Name);
+        }
+        
+        return Task.FromResult(descriptions);
+    }
+
+    private string GetBasicToolDescription(string toolName)
+    {
+        var lowerName = toolName.ToLower();
+        
+        // Provide intelligent descriptions based on common tool name patterns
+        return lowerName switch
+        {
+            // Initialization and setup tools
+            var name when name.Contains("initialize") && name.Contains("azure") && name.Contains("devops") => 
+                "Initialize Azure DevOps client connection and authenticate with the organization",
+            var name when name.Contains("initialize") => 
+                "Initialize and configure the client connection for the service",
+            
+            // Project and repository management
+            var name when name.Contains("get_projects") => 
+                "Retrieve a comprehensive list of all projects in the organization with metadata",
+            var name when name.Contains("get_repositories") => 
+                "Get all repositories for a specific project with branch and commit information",
+            var name when name.Contains("get_repos") => 
+                "Retrieve repository information including details and statistics",
+            
+            // Pull request operations
+            var name when name.Contains("get_pull_requests") && name.Contains("creation_date") => 
+                "Get pull requests filtered by their creation date range with detailed metadata",
+            var name when name.Contains("get_pull_requests") && name.Contains("closed_date") => 
+                "Get pull requests filtered by their closed/completed date range with status information",
+            var name when name.Contains("get_pull_request_description") => 
+                "Get detailed description, comments, and metadata for specific pull requests",
+            var name when name.Contains("get_pull_requests") => 
+                "Retrieve pull requests with various filters (status, branch, author, etc.)",
+            
+            // Commit and branch operations
+            var name when name.Contains("get_commits") => 
+                "Retrieve commit information including messages, authors, and timestamps",
+            var name when name.Contains("get_branches") => 
+                "Get branch information including protection rules and latest commits",
+            
+            // Work item operations
+            var name when name.Contains("get_work_items") => 
+                "Retrieve work items (bugs, tasks, user stories) with detailed field information",
+            var name when name.Contains("work_items") => 
+                "Query and retrieve work items using WIQL (Work Item Query Language)",
+            
+            // Data analysis and processing
+            var name when name.Contains("analyze") => 
+                "Analyze data or content to extract insights and patterns",
+            var name when name.Contains("search") => 
+                "Search for specific items or content across the system",
+            var name when name.Contains("filter") => 
+                "Filter data based on specified criteria and conditions",
+            var name when name.Contains("sort") => 
+                "Sort data by specified fields and criteria",
+            
+            // CRUD operations
+            var name when name.Contains("create") => 
+                "Create new resources, items, or entities in the system",
+            var name when name.Contains("update") => 
+                "Update existing resources, items, or entities with new information",
+            var name when name.Contains("delete") => 
+                "Delete resources, items, or entities from the system",
+            
+            // Data import/export
+            var name when name.Contains("export") => 
+                "Export data or reports in various formats (JSON, CSV, etc.)",
+            var name when name.Contains("import") => 
+                "Import data or content from external sources",
+            
+            // Validation and testing
+            var name when name.Contains("validate") => 
+                "Validate data, configurations, or system state",
+            var name when name.Contains("test") => 
+                "Run tests, validations, or health checks",
+            
+            // Reporting and formatting
+            var name when name.Contains("report") => 
+                "Generate formatted reports or summaries of data",
+            var name when name.Contains("format") => 
+                "Format data or content for display or export",
+            var name when name.Contains("summarize") => 
+                "Create summaries or overviews of data or results",
+            
+            // Default case with more context
+            _ => $"Execute the {toolName} operation - analyze the tool name to understand its purpose"
+        };
     }
 
     private async Task<List<string>> GetGitServerToolsAsync(RunningServerInfo server)

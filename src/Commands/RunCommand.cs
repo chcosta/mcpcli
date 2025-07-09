@@ -1,4 +1,5 @@
 using System.CommandLine;
+using System.CommandLine.Invocation;
 using Microsoft.Extensions.Logging;
 using McpCli.Services;
 using McpCli.Models;
@@ -15,7 +16,9 @@ public class RunCommand
     private readonly IAzureAiService _azureAiService;
     private readonly IPromptFileService _promptFileService;
     private readonly ISystemPromptService _systemPromptService;
-    private readonly IAiPlanningService? _aiPlanningService;
+    private readonly IPlanGenerator? _planGenerator;
+    private readonly IPlanExecutor? _planExecutor;
+    private readonly IPlanPersistenceService? _planPersistenceService;
     private readonly IMultiMcpServerService _multiMcpServerService;
 
     public RunCommand(
@@ -28,7 +31,9 @@ public class RunCommand
         IPromptFileService promptFileService,
         ISystemPromptService systemPromptService,
         IMultiMcpServerService multiMcpServerService,
-        IAiPlanningService? aiPlanningService = null)
+        IPlanGenerator? planGenerator = null,
+        IPlanExecutor? planExecutor = null,
+        IPlanPersistenceService? planPersistenceService = null)
     {
         _logger = logger;
         _markdownConfigService = markdownConfigService;
@@ -39,7 +44,9 @@ public class RunCommand
         _promptFileService = promptFileService;
         _systemPromptService = systemPromptService;
         _multiMcpServerService = multiMcpServerService;
-        _aiPlanningService = aiPlanningService;
+        _planGenerator = planGenerator;
+        _planExecutor = planExecutor;
+        _planPersistenceService = planPersistenceService;
     }
 
     public Command CreateCommand()
@@ -82,6 +89,24 @@ public class RunCommand
             description: "Enable preview features like AI planning (overrides config setting)",
             getDefaultValue: () => false);
 
+        var planIdOption = new Option<string>(
+            name: "--plan-id",
+            description: "Execute a specific plan by ID");
+
+        var listPlansOption = new Option<bool>(
+            name: "--list-plans",
+            description: "List available plans",
+            getDefaultValue: () => false);
+
+        var viewPlanOption = new Option<string>(
+            name: "--view-plan",
+            description: "View details of a specific plan");
+
+        var cleanupPlansOption = new Option<bool>(
+            name: "--cleanup-plans",
+            description: "Clean up old plans",
+            getDefaultValue: () => false);
+
         var command = new Command("run", "Run MCP CLI using a Markdown configuration file")
         {
             configFileOption,
@@ -90,18 +115,33 @@ public class RunCommand
             listPromptsOption,
             promptIndexOption,
             workingDirOption,
-            previewFeaturesOption
+            previewFeaturesOption,
+            planIdOption,
+            listPlansOption,
+            viewPlanOption,
+            cleanupPlansOption
         };
 
-        command.SetHandler(async (configFile, prompt, promptFile, listPrompts, promptIndex, workingDir, previewFeatures) =>
+        command.SetHandler(async (InvocationContext context) =>
         {
-            await ExecuteAsync(configFile, prompt, promptFile, listPrompts, promptIndex, workingDir, previewFeatures);
-        }, configFileOption, promptOption, promptFileOption, listPromptsOption, promptIndexOption, workingDirOption, previewFeaturesOption);
+            var configFile = context.ParseResult.GetValueForOption(configFileOption)!;
+            var prompt = context.ParseResult.GetValueForOption(promptOption);
+            var promptFile = context.ParseResult.GetValueForOption(promptFileOption);
+            var listPrompts = context.ParseResult.GetValueForOption(listPromptsOption);
+            var promptIndex = context.ParseResult.GetValueForOption(promptIndexOption);
+            var workingDir = context.ParseResult.GetValueForOption(workingDirOption);
+            var previewFeatures = context.ParseResult.GetValueForOption(previewFeaturesOption);
+            var planId = context.ParseResult.GetValueForOption(planIdOption);
+            var listPlans = context.ParseResult.GetValueForOption(listPlansOption);
+            var viewPlan = context.ParseResult.GetValueForOption(viewPlanOption);
+            var cleanupPlans = context.ParseResult.GetValueForOption(cleanupPlansOption);
+            await ExecuteAsync(configFile, prompt, promptFile, listPrompts, promptIndex, workingDir, previewFeatures, planId, listPlans, viewPlan, cleanupPlans);
+        });
 
         return command;
     }
 
-    private async Task ExecuteAsync(string configFile, string? prompt, string? promptFile, bool listPrompts, int promptIndex, string workingDir, bool previewFeatures)
+    private async Task ExecuteAsync(string configFile, string? prompt, string? promptFile, bool listPrompts, int promptIndex, string workingDir, bool previewFeatures, string? planId, bool listPlans, string? viewPlan, bool cleanupPlans)
     {
         try
         {
@@ -176,8 +216,27 @@ public class RunCommand
             // Apply configuration to services
             await ApplyConfigurationAsync(markdownConfig);
 
+            // Handle plan management operations
+            if (listPlans)
+            {
+                await ListPlansAsync();
+                return;
+            }
+
+            if (!string.IsNullOrEmpty(viewPlan))
+            {
+                await ViewPlanAsync(viewPlan);
+                return;
+            }
+
+            if (cleanupPlans)
+            {
+                await CleanupPlansAsync();
+                return;
+            }
+
             // Execute the main workflow
-            await ExecuteWorkflowAsync(markdownConfig, selectedPrompt, workingDir, previewFeatures, configFile, promptFile);
+            await ExecuteWorkflowAsync(markdownConfig, selectedPrompt, workingDir, previewFeatures, configFile, promptFile, planId);
         }
         catch (Exception ex)
         {
@@ -221,7 +280,7 @@ public class RunCommand
         }
     }
 
-    private async Task ExecuteWorkflowAsync(Models.MarkdownConfig markdownConfig, string prompt, string workingDir, bool previewFeaturesFlag, string configFile, string? promptFile)
+    private async Task ExecuteWorkflowAsync(Models.MarkdownConfig markdownConfig, string prompt, string workingDir, bool previewFeaturesFlag, string configFile, string? promptFile, string? planId)
     {
         var executionSummary = new Models.ExecutionSummary
         {
@@ -258,6 +317,13 @@ public class RunCommand
 
             // Determine if preview features should be used
             bool usePreviewFeatures = previewFeaturesFlag || markdownConfig.PreviewFeatures;
+
+            // Check if we should execute a specific plan
+            if (!string.IsNullOrEmpty(planId))
+            {
+                await ExecutePlanAsync(planId, enabledServers, workingDir, usePreviewFeatures, markdownConfig, executionSummary);
+                return;
+            }
 
             // Always use multi-server mode - supports single server configurations as well
             await ExecuteMultiServerWorkflowAsync(enabledServers, prompt, workingDir, usePreviewFeatures, markdownConfig, executionSummary);
@@ -307,13 +373,13 @@ public class RunCommand
             string finalResponse;
             if (usePreviewFeatures)
             {
-                Console.WriteLine($"Using preview features (Multi-Server AI Planning Mode)");
-                executionSummary.ExecutionMode = "Multi-Server AI Planning Mode";
+                Console.WriteLine($"Using preview features (AI Planning Mode)");
+                executionSummary.ExecutionMode = "AI Planning Mode";
                 
-                if (_aiPlanningService != null)
+                if (_planGenerator != null && _planExecutor != null && _planPersistenceService != null)
                 {
-                    Console.WriteLine("Using Multi-Server AI Planning Service");
-                    finalResponse = await _aiPlanningService.ProcessPromptWithMultiServerAIAsync(successfulServers, serverToolMapping, prompt, markdownConfig, executionSummary);
+                    Console.WriteLine("Using AI Planning Service");
+                    finalResponse = await ProcessPromptWithAIPlanningAsync(successfulServers, serverToolMapping, prompt, markdownConfig, executionSummary);
                 }
                 else
                 {
@@ -339,6 +405,42 @@ public class RunCommand
             Console.WriteLine("\n🛑 Stopping all servers...");
             await _multiMcpServerService.StopServersAsync(runningServers);
             Console.WriteLine("All servers stopped.");
+        }
+    }
+
+    private async Task<string> ProcessPromptWithAIPlanningAsync(List<RunningServerInfo> runningServers, ServerToolMapping serverToolMapping, string userPrompt, MarkdownConfig config, ExecutionSummary executionSummary)
+    {
+        try
+        {
+            Console.WriteLine("🤖 Generating AI-powered execution plan...");
+            
+            // Step 1: Generate plan using AI
+            var plan = await _planGenerator!.GeneratePlanAsync(userPrompt, runningServers, serverToolMapping, executionSummary);
+            
+            // Step 2: Save plan to markdown
+            await _planPersistenceService!.SavePlanAsync(plan);
+            Console.WriteLine($"📋 Plan generated: {plan.Name} (ID: {plan.Id})");
+            Console.WriteLine($"   Steps: {plan.Steps.Count}");
+            
+            // Step 3: Execute plan
+            Console.WriteLine("🚀 Executing plan...");
+            var executionResult = await _planExecutor!.ExecutePlanAsync(plan, runningServers, serverToolMapping);
+            
+            // Step 4: Return final response
+            if (executionResult.IsSuccessful)
+            {
+                var response = executionResult.FinalOutputs.GetValueOrDefault("response")?.ToString();
+                return response ?? "Plan executed successfully.";
+            }
+            else
+            {
+                return $"Plan execution failed: {executionResult.ErrorMessage}";
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error processing prompt with AI planning");
+            return $"Error processing request with AI planning: {ex.Message}";
         }
     }
 
@@ -491,43 +593,7 @@ Consolidate information from different servers where appropriate.
         return string.Join("\n", toolsInfo);
     }
 
-    private async Task<string> ProcessPromptWithAIAsync(McpServerInfo serverInfo, string userPrompt, Models.MarkdownConfig config, Models.ExecutionSummary executionSummary)
-    {
-        try
-        {
-            // Step 1: Get available tools from MCP server
-            var availableTools = await _mcpServerService.SendPromptAsync(serverInfo, userPrompt);
-            
-            if (availableTools.StartsWith("MCP server error"))
-            {
-                return availableTools;
-            }
 
-            // Step 2: Use AI to determine which tools to call and how
-            var aiPlanningPrompt = await _aiPlanningService!.GetAiPlanningPromptAsync(config, userPrompt, availableTools);
-
-            var aiResponse = await _azureAiService.SendPromptAsync(aiPlanningPrompt);
-            
-            // Step 3: Parse AI response and execute tools
-            var toolResults = await _aiPlanningService!.ExecuteAIToolPlanAsync(serverInfo, aiResponse, config);
-            
-            // Step 4: Send results back to AI for final processing
-            var finalPrompt = $@"
-User's original request: {userPrompt}
-
-Tool execution results: {toolResults}
-
-Please provide a helpful, natural language response to the user based on these results.
-";
-
-            return await _azureAiService.SendPromptAsync(finalPrompt);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error processing prompt with AI");
-            return $"Error processing request: {ex.Message}";
-        }
-    }
 
     private async Task<string> ProcessPromptDirectlyAsync(McpServerInfo serverInfo, string userPrompt, Models.MarkdownConfig config, Models.ExecutionSummary executionSummary, Dictionary<string, Dictionary<string, object>>? serverToolDefaults = null)
     {
@@ -1290,6 +1356,51 @@ Please provide a helpful, natural language response to the user based on these r
             }
         }
 
+        if (executionSummary.SystemPromptFilesRead.Count > 0)
+        {
+            if (!hasFiles)
+            {
+                Console.WriteLine();
+                Console.WriteLine("📄 Files Read:");
+                hasFiles = true;
+            }
+            Console.WriteLine("   System Prompt Files:");
+            foreach (var file in executionSummary.SystemPromptFilesRead)
+            {
+                Console.WriteLine($"     • {file}");
+            }
+        }
+
+        if (executionSummary.PlanFilesRead.Count > 0)
+        {
+            if (!hasFiles)
+            {
+                Console.WriteLine();
+                Console.WriteLine("📄 Files Read:");
+                hasFiles = true;
+            }
+            Console.WriteLine("   Plan Files:");
+            foreach (var file in executionSummary.PlanFilesRead)
+            {
+                Console.WriteLine($"     • {file}");
+            }
+        }
+
+        if (executionSummary.StepResultFilesRead.Count > 0)
+        {
+            if (!hasFiles)
+            {
+                Console.WriteLine();
+                Console.WriteLine("📄 Files Read:");
+                hasFiles = true;
+            }
+            Console.WriteLine("   Step Result Files:");
+            foreach (var file in executionSummary.StepResultFilesRead)
+            {
+                Console.WriteLine($"     • {file}");
+            }
+        }
+
         if (executionSummary.OtherMarkdownFilesRead.Count > 0)
         {
             if (!hasFiles)
@@ -1308,5 +1419,213 @@ Please provide a helpful, natural language response to the user based on these r
         Console.WriteLine();
         Console.WriteLine("═══════════════════════════════════════════════════════════════");
         Console.WriteLine();
+    }
+
+    private async Task ExecutePlanAsync(string planId, List<MultiMcpServerConfig> enabledServers, string workingDir, bool usePreviewFeatures, MarkdownConfig markdownConfig, ExecutionSummary executionSummary)
+    {
+        try
+        {
+            Console.WriteLine($"📋 Executing plan: {planId}");
+            
+            // Load the plan
+            var plan = await _planPersistenceService!.LoadPlanAsync(planId, executionSummary);
+            if (plan == null)
+            {
+                Console.WriteLine($"❌ Plan not found: {planId}");
+                return;
+            }
+
+            Console.WriteLine($"📋 Plan: {plan.Name}");
+            Console.WriteLine($"🎯 Goal: {plan.Goal}");
+            Console.WriteLine($"📊 Steps: {plan.Steps.Count}");
+
+            // Start servers
+            var runningServers = await _multiMcpServerService.StartServersAsync(markdownConfig, workingDir, executionSummary);
+            var successfulServers = runningServers.Where(s => s.IsRunning).ToList();
+
+            if (successfulServers.Count == 0)
+            {
+                Console.WriteLine("❌ Failed to start any servers.");
+                return;
+            }
+
+            try
+            {
+                // Discover tools
+                var serverToolMapping = await _multiMcpServerService.GetAvailableToolsAsync(successfulServers);
+                
+                // Execute the plan
+                Console.WriteLine("🚀 Executing plan...");
+                var executionResult = await _planExecutor!.ExecutePlanAsync(plan, successfulServers, serverToolMapping);
+                
+                if (executionResult.IsSuccessful)
+                {
+                    Console.WriteLine("✅ Plan executed successfully!");
+                    var response = executionResult.FinalOutputs.GetValueOrDefault("response")?.ToString();
+                    if (!string.IsNullOrEmpty(response))
+                    {
+                        Console.WriteLine("\n📄 Final Response:");
+                        Console.WriteLine(response);
+                    }
+                }
+                else
+                {
+                    Console.WriteLine($"❌ Plan execution failed: {executionResult.ErrorMessage}");
+                }
+            }
+            finally
+            {
+                // Clean up servers
+                await _multiMcpServerService.StopServersAsync(runningServers);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error executing plan");
+            Console.WriteLine($"❌ Error executing plan: {ex.Message}");
+        }
+    }
+
+    private async Task ListPlansAsync()
+    {
+        try
+        {
+            if (_planPersistenceService == null)
+            {
+                Console.WriteLine("❌ Plan persistence service not available");
+                return;
+            }
+
+            Console.WriteLine("📋 Available Plans:");
+            Console.WriteLine("==================");
+
+            var plans = await _planPersistenceService.ListPlansAsync();
+            if (plans.Count == 0)
+            {
+                Console.WriteLine("No plans found.");
+                return;
+            }
+
+            foreach (var plan in plans.OrderByDescending(p => p.CreatedAt))
+            {
+                var status = plan.Status switch
+                {
+                    PlanStatus.Created => "📝 Created",
+                    PlanStatus.InProgress => "🔄 In Progress",
+                    PlanStatus.Completed => "✅ Completed",
+                    PlanStatus.Failed => "❌ Failed",
+                    _ => "❓ Unknown"
+                };
+
+                Console.WriteLine($"\n{status} | {plan.Name}");
+                Console.WriteLine($"   ID: {plan.Id}");
+                Console.WriteLine($"   Created: {plan.CreatedAt:yyyy-MM-dd HH:mm:ss}");
+                Console.WriteLine($"   Steps: {plan.Steps.Count}");
+                Console.WriteLine($"   Goal: {plan.Goal}");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error listing plans");
+            Console.WriteLine($"❌ Error listing plans: {ex.Message}");
+        }
+    }
+
+    private async Task ViewPlanAsync(string planId)
+    {
+        try
+        {
+            if (_planPersistenceService == null)
+            {
+                Console.WriteLine("❌ Plan persistence service not available");
+                return;
+            }
+
+            var plan = await _planPersistenceService.LoadPlanAsync(planId);
+            if (plan == null)
+            {
+                Console.WriteLine($"❌ Plan not found: {planId}");
+                return;
+            }
+
+            Console.WriteLine($"📋 Plan Details: {plan.Name}");
+            Console.WriteLine(new string('=', 50));
+            Console.WriteLine($"ID: {plan.Id}");
+            Console.WriteLine($"Status: {plan.Status}");
+            Console.WriteLine($"Created: {plan.CreatedAt:yyyy-MM-dd HH:mm:ss}");
+            Console.WriteLine($"Goal: {plan.Goal}");
+            Console.WriteLine($"Steps: {plan.Steps.Count}");
+
+            if (plan.Variables?.Count > 0)
+            {
+                Console.WriteLine($"\n📊 Variables:");
+                foreach (var variable in plan.Variables)
+                {
+                    Console.WriteLine($"   {variable.Key}: {variable.Value}");
+                }
+            }
+
+            Console.WriteLine($"\n📝 Steps:");
+            for (int i = 0; i < plan.Steps.Count; i++)
+            {
+                var step = plan.Steps[i];
+                var status = step.Status switch
+                {
+                    StepStatus.Pending => "⏳ Pending",
+                    StepStatus.InProgress => "🔄 In Progress",
+                    StepStatus.Completed => "✅ Completed",
+                    StepStatus.Failed => "❌ Failed",
+                    StepStatus.Skipped => "⏭️ Skipped",
+                    _ => "❓ Unknown"
+                };
+
+                Console.WriteLine($"\n{i + 1}. {status} | {step.Name}");
+                Console.WriteLine($"   Description: {step.Description}");
+                Console.WriteLine($"   Server: {step.ServerName}");
+                Console.WriteLine($"   Tool: {step.ToolName}");
+
+                if (step.Inputs?.Count > 0)
+                {
+                    Console.WriteLine($"   Inputs: {string.Join(", ", step.Inputs.Select(kvp => $"{kvp.Key}={kvp.Value}"))}");
+                }
+
+                if (step.ActualOutputs?.Count > 0)
+                {
+                    Console.WriteLine($"   Outputs: {string.Join(", ", step.ActualOutputs.Select(kvp => $"{kvp.Key}={kvp.Value}"))}");
+                }
+
+                if (!string.IsNullOrEmpty(step.ErrorMessage))
+                {
+                    Console.WriteLine($"   Error: {step.ErrorMessage}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error viewing plan");
+            Console.WriteLine($"❌ Error viewing plan: {ex.Message}");
+        }
+    }
+
+    private async Task CleanupPlansAsync()
+    {
+        try
+        {
+            if (_planPersistenceService == null)
+            {
+                Console.WriteLine("❌ Plan persistence service not available");
+                return;
+            }
+
+            Console.WriteLine("🧹 Cleaning up old plans...");
+            
+            var deletedCount = await _planPersistenceService.CleanupOldPlansAsync();
+            Console.WriteLine($"✅ Cleaned up {deletedCount} old plans");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error cleaning up plans");
+            Console.WriteLine($"❌ Error cleaning up plans: {ex.Message}");
+        }
     }
 }

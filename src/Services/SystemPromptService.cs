@@ -7,23 +7,33 @@ public class SystemPromptService : ISystemPromptService
 {
     private readonly ILogger<SystemPromptService> _logger;
     private readonly IMarkdownConfigService _markdownConfigService;
+    private readonly IRepositoryRootService _repositoryRootService;
 
-    public SystemPromptService(ILogger<SystemPromptService> logger, IMarkdownConfigService markdownConfigService)
+    public SystemPromptService(ILogger<SystemPromptService> logger, IMarkdownConfigService markdownConfigService, IRepositoryRootService repositoryRootService)
     {
         _logger = logger;
         _markdownConfigService = markdownConfigService;
+        _repositoryRootService = repositoryRootService;
     }
 
-    public async Task<string> LoadPromptAsync(string promptFilePath)
+    public async Task<string> LoadPromptAsync(string promptFilePath, Models.ExecutionSummary? executionSummary = null)
     {
         try
         {
-            if (!File.Exists(promptFilePath))
+            // Resolve relative paths relative to repository root
+            var resolvedFilePath = _repositoryRootService.IsRelativePath(promptFilePath) 
+                ? _repositoryRootService.ResolvePath(promptFilePath) 
+                : promptFilePath;
+
+            if (!File.Exists(resolvedFilePath))
             {
-                throw new FileNotFoundException($"Prompt file not found: {promptFilePath}");
+                throw new FileNotFoundException($"Prompt file not found: {resolvedFilePath}");
             }
 
-            var content = await File.ReadAllTextAsync(promptFilePath);
+            // Track file read in execution summary
+            executionSummary?.AddSystemPromptFileRead(resolvedFilePath);
+
+            var content = await File.ReadAllTextAsync(resolvedFilePath);
             
             // Extract the prompt content (everything after YAML frontmatter)
             var frontmatterMatch = Regex.Match(content, @"^---\s*\n(.*?)\n---\s*\n", RegexOptions.Singleline);
@@ -45,11 +55,11 @@ public class SystemPromptService : ISystemPromptService
         }
     }
 
-    public async Task<string> ProcessPromptAsync(string promptFilePath, Dictionary<string, string> variables)
+    public async Task<string> ProcessPromptAsync(string promptFilePath, Dictionary<string, string> variables, Models.ExecutionSummary? executionSummary = null)
     {
         try
         {
-            var promptContent = await LoadPromptAsync(promptFilePath);
+            var promptContent = await LoadPromptAsync(promptFilePath, executionSummary);
             
             // Replace variables in the format {{VARIABLE_NAME}}
             foreach (var variable in variables)
@@ -75,23 +85,31 @@ public class SystemPromptService : ISystemPromptService
         }
     }
 
-    public async Task<bool> ValidatePromptFileAsync(string promptFilePath)
+    public async Task<bool> ValidatePromptFileAsync(string promptFilePath, Models.ExecutionSummary? executionSummary = null)
     {
         try
         {
-            if (!File.Exists(promptFilePath))
+            // Resolve relative paths relative to repository root
+            var resolvedFilePath = _repositoryRootService.IsRelativePath(promptFilePath) 
+                ? _repositoryRootService.ResolvePath(promptFilePath) 
+                : promptFilePath;
+
+            if (!File.Exists(resolvedFilePath))
             {
-                _logger.LogWarning("Prompt file not found: {PromptFilePath}", promptFilePath);
+                _logger.LogWarning("Prompt file not found: {PromptFilePath}", resolvedFilePath);
                 return false;
             }
 
-            var content = await File.ReadAllTextAsync(promptFilePath);
+            // Track file read in execution summary
+            executionSummary?.AddSystemPromptFileRead(resolvedFilePath);
+
+            var content = await File.ReadAllTextAsync(resolvedFilePath);
             
             // Check if it has YAML frontmatter
             var frontmatterMatch = Regex.Match(content, @"^---\s*\n(.*?)\n---\s*\n", RegexOptions.Singleline);
             if (!frontmatterMatch.Success)
             {
-                _logger.LogWarning("Prompt file missing YAML frontmatter: {PromptFilePath}", promptFilePath);
+                _logger.LogWarning("Prompt file missing YAML frontmatter: {PromptFilePath}", resolvedFilePath);
                 return false;
             }
 
@@ -99,7 +117,7 @@ public class SystemPromptService : ISystemPromptService
             var promptContent = content.Substring(frontmatterMatch.Length).Trim();
             if (string.IsNullOrEmpty(promptContent))
             {
-                _logger.LogWarning("Prompt file has no content after frontmatter: {PromptFilePath}", promptFilePath);
+                _logger.LogWarning("Prompt file has no content after frontmatter: {PromptFilePath}", resolvedFilePath);
                 return false;
             }
 

@@ -8,17 +8,24 @@ namespace McpCli.Services;
 public class PromptFileService : IPromptFileService
 {
     private readonly ILogger<PromptFileService> _logger;
+    private readonly IRepositoryRootService _repositoryRootService;
 
-    public PromptFileService(ILogger<PromptFileService> logger)
+    public PromptFileService(ILogger<PromptFileService> logger, IRepositoryRootService repositoryRootService)
     {
         _logger = logger;
+        _repositoryRootService = repositoryRootService;
     }
 
     public async Task<PromptFile> ParsePromptFileAsync(string filePath)
     {
         try
         {
-            var content = await File.ReadAllTextAsync(filePath);
+            // Resolve relative paths relative to repository root
+            var resolvedFilePath = _repositoryRootService.IsRelativePath(filePath) 
+                ? _repositoryRootService.ResolvePath(filePath) 
+                : filePath;
+
+            var content = await File.ReadAllTextAsync(resolvedFilePath);
             var promptFile = new PromptFile();
 
             // Parse YAML frontmatter
@@ -152,19 +159,24 @@ public class PromptFileService : IPromptFileService
     {
         try
         {
-            if (!Directory.Exists(directory))
+            // Resolve relative paths relative to repository root
+            var resolvedDirectory = _repositoryRootService.IsRelativePath(directory) 
+                ? _repositoryRootService.ResolvePath(directory) 
+                : directory;
+
+            if (!Directory.Exists(resolvedDirectory))
             {
                 return new List<string>();
             }
 
             // Make this truly async by using Task.Run for the file system operations
             var files = await Task.Run(() => 
-                Directory.GetFiles(directory, "*.md", SearchOption.AllDirectories)
+                Directory.GetFiles(resolvedDirectory, "*.md", SearchOption.AllDirectories)
                     .Where(f => Path.GetFileName(f).StartsWith("prompt-") || 
                                Path.GetFileName(f).Contains("prompt"))
                     .ToList());
 
-            _logger.LogInformation("Found {Count} prompt files in {Directory}", files.Count, directory);
+            _logger.LogInformation("Found {Count} prompt files in {Directory}", files.Count, resolvedDirectory);
             return files;
         }
         catch (Exception ex)
