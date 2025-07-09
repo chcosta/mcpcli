@@ -50,7 +50,7 @@ public class AdvancedPlanExecutor : IPlanExecutor
             };
 
             // Execute the plan
-            var result = await ExecutePlanWithRetryAsync(plan, runningServers, toolMapping, executionContext);
+            var result = await ExecutePlanWithRetryAsync(plan, runningServers, toolMapping, executionContext, plan.Goal);
 
             _logger.LogInformation("Advanced plan execution completed for plan {PlanId}", plan.Id);
             return result;
@@ -71,7 +71,8 @@ public class AdvancedPlanExecutor : IPlanExecutor
         Plan plan, 
         List<RunningServerInfo> runningServers, 
         ServerToolMapping toolMapping, 
-        ExecutionContext executionContext)
+        ExecutionContext executionContext,
+        string originalUserPrompt) // Add original user prompt parameter
     {
         var results = new List<string>();
         var context = new Dictionary<string, object>();
@@ -113,7 +114,7 @@ public class AdvancedPlanExecutor : IPlanExecutor
                 }
 
                 // Execute step with retry logic
-                var stepResult = await ExecuteStepWithRetryAsync(validatedStep, context, runningServers, toolMapping, executionContext);
+                var stepResult = await ExecuteStepWithRetryAsync(validatedStep, context, runningServers, toolMapping, executionContext, originalUserPrompt);
                 
                 if (stepResult.Success)
                 {
@@ -220,7 +221,8 @@ public class AdvancedPlanExecutor : IPlanExecutor
         Dictionary<string, object> context, 
         List<RunningServerInfo> runningServers, 
         ServerToolMapping toolMapping, 
-        ExecutionContext executionContext)
+        ExecutionContext executionContext,
+        string originalUserPrompt) // Add original user prompt parameter
     {
         var retryCount = 0;
         Exception? lastException = null;
@@ -271,7 +273,11 @@ public class AdvancedPlanExecutor : IPlanExecutor
                     // Prompt-based step: use AI to select and execute the tool
                     var toolList = await BuildToolListWithServerInfoAsync(toolMapping, runningServers);
                     var aiPrompt = $@"
-You are an AI assistant. The user wants to: {step.Prompt}
+You are an AI assistant executing a step in a larger plan.
+
+ORIGINAL USER REQUEST: {originalUserPrompt}
+
+CURRENT STEP GOAL: {step.Prompt}
 
 {(!string.IsNullOrEmpty(previousStepContext) ? $"IMPORTANT - Previous step results (use this data to extract required parameters):\n{previousStepContext}\n" : "")}
 
@@ -279,20 +285,33 @@ Available tools:
 {toolList}
 
 INSTRUCTIONS:
-1. ANALYZE the previous step results above to extract any required parameter values (project names, repository names, dates, etc.)
-2. DO NOT use placeholder values like ""Specify the project name"" - extract actual values from the previous step results
-3. If previous steps contain project lists, repository lists, or other data, use the actual names/values from that data
-4. Select the single best tool from the list above to accomplish the user's request
-5. Use the exact parameter names shown in the tool descriptions above
-6. Provide the tool name and parameters with REAL VALUES (not placeholders) as JSON
+1. CONSIDER the original user request above to understand the broader context and intent
+2. FOCUS on the current step goal while keeping the original request in mind
+3. EXTRACT required parameter values from BOTH the current step goal AND previous step results:
+   - First, look for parameter values directly mentioned in the CURRENT STEP GOAL (e.g., project names, repository names, branch names, counts, etc.)
+   - Then, supplement with any additional parameter values from previous step results
+   - Use actual values from either source - do NOT use placeholder values like ""Specify the project name""
+4. EXAMPLES of parameter extraction from current step goal:
+   - ""Get repositories in the internal project"" -> projectName: ""internal""
+   - ""Get repositories from the internal project"" -> projectName: ""internal""
+   - ""Get all repositories from the internal project in the Azure DevOps organization"" -> projectName: ""internal""
+   - ""List 5 recent pull requests"" -> maxCount: 5
+   - ""Get pull requests targeting main branch"" -> targetBranch: ""main""
+   - ""Find pull requests in dotnet-helix-service repository"" -> repositoryName: ""dotnet-helix-service""
+   - ""Get builds for the public project"" -> projectName: ""public""
+   - ""Show repositories in dnceng organization"" -> organizationName: ""dnceng""
+5. If previous steps contain additional data (project lists, repository lists, etc.), use those actual names/values to supplement
+6. Select the single best tool from the list above to accomplish the current step goal
+7. Use the exact parameter names shown in the tool descriptions above
+8. Provide the tool name and parameters with REAL VALUES (not placeholders) as JSON
 
 Response format:
 {{
   ""tool"": ""tool_name"",
-  ""parameters"": {{ ""param1"": ""actual_value_from_previous_steps"", ""param2"": ""another_real_value"" }}
+  ""parameters"": {{ ""param1"": ""actual_value_from_step_goal_or_previous_results"", ""param2"": ""another_real_value"" }}
 }}
 
-If you cannot extract the required parameters from previous step results, return an empty JSON object {{}}.
+If you cannot extract the required parameters from either the current step goal or previous step results, return an empty JSON object {{}}.
 Do not invent tool names. Only use tools from the list above.
 ";
 
